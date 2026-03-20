@@ -2,7 +2,14 @@ import random
 from collections import deque
 
 
-class SimpleRuleAgent:
+class TacticalRuleAgent:
+    """
+    Higher-complexity tactical agent:
+    - danger-aware navigation,
+    - adaptive objective priorities (item > box farm > pressure enemy),
+    - bombing only with value and escape.
+    """
+
     MOVES = {
         0: (0, 0),
         1: (-1, 0),
@@ -11,75 +18,67 @@ class SimpleRuleAgent:
         4: (0, 1),
     }
 
-    def __init__(self, player_id):
-        self.player_id = int(player_id)
+    def __init__(self, player_id: int):
+        self.id = int(player_id)
 
-    def act(self, observation):
-        grid = observation["map"]
-        players = observation["players"]
-        bombs = observation["bombs"]
+    def act(self, obs):
+        grid = obs["map"]
+        players = obs["players"]
+        bombs = obs["bombs"]
 
-        if self.player_id >= len(players) or players[self.player_id][2] != 1:
+        if self.id >= len(players) or players[self.id][2] != 1:
             return 0
 
-        my_x, my_y, _, bombs_left, bomb_bonus = players[self.player_id]
+        my_x, my_y, _, bombs_left, bomb_bonus = players[self.id]
         my_pos = (int(my_x), int(my_y))
         bomb_radius = max(1, int(bomb_bonus) + 1)
         bomb_positions = {(int(b[0]), int(b[1])) for b in bombs}
 
-        occupied = {
-            (int(p[0]), int(p[1]))
-            for i, p in enumerate(players)
-            if i != self.player_id and p[2] == 1
-        }
         enemies = [
             (int(p[0]), int(p[1]))
             for i, p in enumerate(players)
-            if i != self.player_id and p[2] == 1
+            if i != self.id and p[2] == 1
         ]
-
+        occupied = set(enemies)
         blocked = set(occupied) | bomb_positions
         blocked.discard(my_pos)
 
         danger_soon, danger_now = self._danger_tiles(grid, bombs, players, default_radius=2)
         valid_actions = self._valid_actions(grid, my_pos, blocked)
 
-        # 1) Escape danger first
         if my_pos in danger_now or my_pos in danger_soon:
-            move = self._move_to_targets(grid, my_pos, blocked, self._safe_tiles(grid, danger_soon), danger_soon)
-            if move is not None:
-                return move
-            safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_now]
-            return random.choice(safe_moves) if safe_moves else 0
+            escape = self._best_escape_action(grid, my_pos, blocked, danger_now, danger_soon)
+            return escape if escape is not None else 0
 
-        # 2) Pick nearby items
         item_tiles = self._item_tiles(
             grid,
             prefer_capacity=int(bombs_left) <= 1,
             prefer_radius=int(bomb_bonus) <= 1,
         )
         if item_tiles:
-            move = self._move_to_targets(grid, my_pos, blocked, item_tiles, danger_soon)
+            move = self._move_to_targets(grid, my_pos, item_tiles, blocked, danger_soon)
             if move is not None:
                 return move
 
-        # 3) Place bomb to break adjacent boxes or hit adjacent enemy (if escape exists)
         if bombs_left > 0 and my_pos not in bomb_positions:
-            adjacent_enemy = any(abs(ex - my_pos[0]) + abs(ey - my_pos[1]) == 1 for ex, ey in enemies)
+            can_hit_enemy = self._can_bomb_hit_enemy(grid, my_pos, enemies, bomb_radius)
             boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
-            if (adjacent_enemy or boxes_hit > 0) and self._can_escape_after_placing(
+            if (can_hit_enemy or boxes_hit >= 1) and self._can_escape_after_placing(
                 grid, my_pos, blocked, danger_now, bomb_radius
             ):
                 return 5
 
-        # 4) Move toward a tile where bombing would break boxes
         box_spots = self._box_bomb_spots(grid, blocked)
         if box_spots:
-            move = self._move_to_targets(grid, my_pos, blocked, box_spots, danger_soon)
+            move = self._move_to_targets(grid, my_pos, box_spots, blocked, danger_soon)
             if move is not None:
                 return move
 
-        # 5) Fallback safe movement
+        if enemies:
+            move = self._move_to_targets(grid, my_pos, set(enemies), blocked, danger_soon)
+            if move is not None:
+                return move
+
         safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_soon]
         return random.choice(safe_moves) if safe_moves else 0
 
@@ -133,15 +132,31 @@ class SimpleRuleAgent:
                 danger_now |= blast
         return danger_soon, danger_now
 
-    def _safe_tiles(self, grid, danger_soon):
-        safe = set()
-        for x in range(grid.shape[0]):
-            for y in range(grid.shape[1]):
-                if grid[x, y] in [0, 3, 4] and (x, y) not in danger_soon:
-                    safe.add((x, y))
-        return safe
+    def _open_neighbors(self, grid, pos, occupied):
+        cnt = 0
+        for a in [1, 2, 3, 4]:
+            nx, ny = self._next_pos(pos, a)
+            if self._passable(grid, nx, ny) and (nx, ny) not in occupied:
+                cnt += 1
+        return cnt
 
-    def _move_to_targets(self, grid, start, occupied, targets, danger_soon):
+    def _best_escape_action(self, grid, my_pos, occupied, danger_now, danger_soon):
+        best_action = None
+        best_score = -10**9
+        for a in self._valid_actions(grid, my_pos, occupied):
+            npos = self._next_pos(my_pos, a)
+            if npos in danger_now:
+                continue
+            score = 0
+            if npos not in danger_soon:
+                score += 6
+            score += self._open_neighbors(grid, npos, occupied)
+            if score > best_score:
+                best_score = score
+                best_action = a
+        return best_action
+
+    def _move_to_targets(self, grid, start, targets, occupied, danger_soon):
         if not targets:
             return None
         q = deque([(start, None)])
@@ -157,13 +172,77 @@ class SimpleRuleAgent:
                     continue
                 if not self._passable(grid, nx, ny):
                     continue
-                if npos in occupied:
+                if npos in occupied and npos not in targets:
                     continue
                 if npos in danger_soon:
                     continue
                 seen.add(npos)
                 q.append((npos, a if first_action is None else first_action))
         return None
+
+    def _line_clear(self, grid, a, b):
+        ax, ay = a
+        bx, by = b
+        if ax == bx:
+            step = 1 if by > ay else -1
+            for y in range(ay + step, by, step):
+                if grid[ax, y] in [1, 2]:
+                    return False
+            return True
+        if ay == by:
+            step = 1 if bx > ax else -1
+            for x in range(ax + step, bx, step):
+                if grid[x, ay] in [1, 2]:
+                    return False
+            return True
+        return False
+
+    def _can_bomb_hit_enemy(self, grid, my_pos, enemies, radius):
+        mx, my = my_pos
+        for ex, ey in enemies:
+            if mx == ex and abs(ey - my) <= radius and self._line_clear(grid, my_pos, (ex, ey)):
+                return True
+            if my == ey and abs(ex - mx) <= radius and self._line_clear(grid, my_pos, (ex, ey)):
+                return True
+        return False
+
+    def _move_to_nearest_safe(self, grid, start, occupied, danger, search_depth=8):
+        q = deque([(start, 0, None)])
+        seen = {start}
+        while q:
+            pos, d, first_action = q.popleft()
+            if pos not in danger and d > 0:
+                return first_action
+            if d >= search_depth:
+                continue
+            for a in [1, 2, 3, 4]:
+                nx, ny = self._next_pos(pos, a)
+                npos = (nx, ny)
+                if not self._passable(grid, nx, ny) or npos in occupied or npos in seen:
+                    continue
+                seen.add(npos)
+                q.append((npos, d + 1, a if first_action is None else first_action))
+        return None
+
+    def _can_escape_after_placing(self, grid, my_pos, occupied, existing_danger, bomb_radius):
+        my_blast = self._blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
+        combined = set(existing_danger) | my_blast
+        return self._move_to_nearest_safe(grid, my_pos, occupied, combined) is not None
+
+    def _count_boxes_in_blast(self, grid, my_pos, radius):
+        return sum(1 for x, y in self._blast_tiles(grid, my_pos[0], my_pos[1], radius) if grid[x, y] == 2)
+
+    def _box_bomb_spots(self, grid, occupied):
+        spots = set()
+        for x in range(grid.shape[0]):
+            for y in range(grid.shape[1]):
+                if grid[x, y] != 2:
+                    continue
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = x + dx, y + dy
+                    if self._passable(grid, nx, ny) and (nx, ny) not in occupied:
+                        spots.add((nx, ny))
+        return spots
 
     def _item_tiles(self, grid, prefer_capacity=False, prefer_radius=False):
         preferred_values = set()
@@ -187,45 +266,3 @@ class SimpleRuleAgent:
             for y in range(grid.shape[1])
             if grid[x, y] in [3, 4]
         }
-
-    def _count_boxes_in_blast(self, grid, my_pos, radius):
-        cnt = 0
-        for x, y in self._blast_tiles(grid, my_pos[0], my_pos[1], radius):
-            if grid[x, y] == 2:
-                cnt += 1
-        return cnt
-
-    def _move_to_nearest_safe(self, grid, start, occupied, danger, search_depth=8):
-        q = deque([(start, 0, None)])
-        seen = {start}
-        while q:
-            pos, d, first_action = q.popleft()
-            if pos not in danger and d > 0:
-                return first_action
-            if d >= search_depth:
-                continue
-            for a in [1, 2, 3, 4]:
-                nx, ny = self._next_pos(pos, a)
-                npos = (nx, ny)
-                if not self._passable(grid, nx, ny) or npos in occupied or npos in seen:
-                    continue
-                seen.add(npos)
-                q.append((npos, d + 1, a if first_action is None else first_action))
-        return None
-
-    def _can_escape_after_placing(self, grid, my_pos, occupied, existing_danger, bomb_radius):
-        my_blast = self._blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-        combined_danger = set(existing_danger) | my_blast
-        return self._move_to_nearest_safe(grid, my_pos, occupied, combined_danger) is not None
-
-    def _box_bomb_spots(self, grid, occupied):
-        targets = set()
-        for x in range(grid.shape[0]):
-            for y in range(grid.shape[1]):
-                if grid[x, y] != 2:
-                    continue
-                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nx, ny = x + dx, y + dy
-                    if self._passable(grid, nx, ny) and (nx, ny) not in occupied:
-                        targets.add((nx, ny))
-        return targets

@@ -2,7 +2,14 @@ import random
 from collections import deque
 
 
-class SimpleRuleAgent:
+class BoxFarmerAgent:
+    """
+    Box-and-item focused agent:
+    - escape first,
+    - collect items,
+    - place bombs to break nearby boxes only with an escape path.
+    """
+
     MOVES = {
         0: (0, 0),
         1: (-1, 0),
@@ -11,18 +18,18 @@ class SimpleRuleAgent:
         4: (0, 1),
     }
 
-    def __init__(self, player_id):
-        self.player_id = int(player_id)
+    def __init__(self, player_id: int):
+        self.id = int(player_id)
 
-    def act(self, observation):
-        grid = observation["map"]
-        players = observation["players"]
-        bombs = observation["bombs"]
+    def act(self, obs):
+        grid = obs["map"]
+        players = obs["players"]
+        bombs = obs["bombs"]
 
-        if self.player_id >= len(players) or players[self.player_id][2] != 1:
+        if self.id >= len(players) or players[self.id][2] != 1:
             return 0
 
-        my_x, my_y, _, bombs_left, bomb_bonus = players[self.player_id]
+        my_x, my_y, _, bombs_left, bomb_bonus = players[self.id]
         my_pos = (int(my_x), int(my_y))
         bomb_radius = max(1, int(bomb_bonus) + 1)
         bomb_positions = {(int(b[0]), int(b[1])) for b in bombs}
@@ -30,29 +37,21 @@ class SimpleRuleAgent:
         occupied = {
             (int(p[0]), int(p[1]))
             for i, p in enumerate(players)
-            if i != self.player_id and p[2] == 1
+            if i != self.id and p[2] == 1
         }
-        enemies = [
-            (int(p[0]), int(p[1]))
-            for i, p in enumerate(players)
-            if i != self.player_id and p[2] == 1
-        ]
-
         blocked = set(occupied) | bomb_positions
         blocked.discard(my_pos)
 
         danger_soon, danger_now = self._danger_tiles(grid, bombs, players, default_radius=2)
         valid_actions = self._valid_actions(grid, my_pos, blocked)
 
-        # 1) Escape danger first
         if my_pos in danger_now or my_pos in danger_soon:
-            move = self._move_to_targets(grid, my_pos, blocked, self._safe_tiles(grid, danger_soon), danger_soon)
-            if move is not None:
-                return move
+            escape = self._move_to_safe(grid, my_pos, blocked, danger_soon)
+            if escape is not None:
+                return escape
             safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_now]
             return random.choice(safe_moves) if safe_moves else 0
 
-        # 2) Pick nearby items
         item_tiles = self._item_tiles(
             grid,
             prefer_capacity=int(bombs_left) <= 1,
@@ -63,23 +62,18 @@ class SimpleRuleAgent:
             if move is not None:
                 return move
 
-        # 3) Place bomb to break adjacent boxes or hit adjacent enemy (if escape exists)
-        if bombs_left > 0 and my_pos not in bomb_positions:
-            adjacent_enemy = any(abs(ex - my_pos[0]) + abs(ey - my_pos[1]) == 1 for ex, ey in enemies)
-            boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
-            if (adjacent_enemy or boxes_hit > 0) and self._can_escape_after_placing(
-                grid, my_pos, blocked, danger_now, bomb_radius
-            ):
-                return 5
+        boxes_here = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
+        if bombs_left > 0 and my_pos not in bomb_positions and boxes_here > 0 and self._can_escape_after_placing(
+            grid, my_pos, blocked, danger_now, bomb_radius
+        ):
+            return 5
 
-        # 4) Move toward a tile where bombing would break boxes
         box_spots = self._box_bomb_spots(grid, blocked)
         if box_spots:
             move = self._move_to_targets(grid, my_pos, blocked, box_spots, danger_soon)
             if move is not None:
                 return move
 
-        # 5) Fallback safe movement
         safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_soon]
         return random.choice(safe_moves) if safe_moves else 0
 
@@ -133,13 +127,14 @@ class SimpleRuleAgent:
                 danger_now |= blast
         return danger_soon, danger_now
 
-    def _safe_tiles(self, grid, danger_soon):
-        safe = set()
-        for x in range(grid.shape[0]):
-            for y in range(grid.shape[1]):
-                if grid[x, y] in [0, 3, 4] and (x, y) not in danger_soon:
-                    safe.add((x, y))
-        return safe
+    def _move_to_safe(self, grid, start, occupied, danger_soon):
+        targets = {
+            (x, y)
+            for x in range(grid.shape[0])
+            for y in range(grid.shape[1])
+            if grid[x, y] in [0, 3, 4] and (x, y) not in danger_soon
+        }
+        return self._move_to_targets(grid, start, occupied, targets, danger_soon)
 
     def _move_to_targets(self, grid, start, occupied, targets, danger_soon):
         if not targets:
@@ -189,11 +184,7 @@ class SimpleRuleAgent:
         }
 
     def _count_boxes_in_blast(self, grid, my_pos, radius):
-        cnt = 0
-        for x, y in self._blast_tiles(grid, my_pos[0], my_pos[1], radius):
-            if grid[x, y] == 2:
-                cnt += 1
-        return cnt
+        return sum(1 for x, y in self._blast_tiles(grid, my_pos[0], my_pos[1], radius) if grid[x, y] == 2)
 
     def _move_to_nearest_safe(self, grid, start, occupied, danger, search_depth=8):
         q = deque([(start, 0, None)])
@@ -215,11 +206,11 @@ class SimpleRuleAgent:
 
     def _can_escape_after_placing(self, grid, my_pos, occupied, existing_danger, bomb_radius):
         my_blast = self._blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-        combined_danger = set(existing_danger) | my_blast
-        return self._move_to_nearest_safe(grid, my_pos, occupied, combined_danger) is not None
+        combined = set(existing_danger) | my_blast
+        return self._move_to_nearest_safe(grid, my_pos, occupied, combined) is not None
 
     def _box_bomb_spots(self, grid, occupied):
-        targets = set()
+        spots = set()
         for x in range(grid.shape[0]):
             for y in range(grid.shape[1]):
                 if grid[x, y] != 2:
@@ -227,5 +218,5 @@ class SimpleRuleAgent:
                 for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nx, ny = x + dx, y + dy
                     if self._passable(grid, nx, ny) and (nx, ny) not in occupied:
-                        targets.add((nx, ny))
-        return targets
+                        spots.add((nx, ny))
+        return spots
