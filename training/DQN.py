@@ -71,19 +71,24 @@ class DQNModel(nn.Module):
         return self.net(x)
 
 class DQNAgent:
-    def __init__(self, agent_id: int, input_dim: int, num_actions: int, device: str="cpu"):
+    def __init__(self, agent_id: int, input_dim: int, num_actions: int, lr: float=1e-3, device: str="cpu", pretrained_model=None):
         self.agent_id = agent_id
         self.num_actions = num_actions
         self.device = device
         self.gamma = 0.99
-        self.lr = 1e-3
-        
+        self.lr = lr
+        self.global_step = 0
+        self.epsilon = 1.0
+
         # Networks: Q-Network (learning) and Target-Network (stable target)
         self.q_net = DQNModel(input_dim, num_actions).to(device)
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr, eps=1e-08, weight_decay=1e-5)
+        if pretrained_model:
+            self.load_agent(pretrained_model)
+
         self.target_net = DQNModel(input_dim, num_actions).to(device)
         self.target_net.load_state_dict(self.q_net.state_dict()) # Sync weights initially
         
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr, eps=1e-08, weight_decay=1e-5)
         self.loss_fn = nn.MSELoss()
 
     def act(self, state_enc: np.ndarray, epsilon=0.0):
@@ -141,6 +146,14 @@ class DQNAgent:
     def update_target_network(self):
         """Copies the learned weights into the target network."""
         self.target_net.load_state_dict(self.q_net.state_dict())
+
+    def load_agent(self, pretrained_model):
+        checkpoint = torch.load(pretrained_model)
+        self.q_net.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.global_step = checkpoint["global_step"]
+        self.epsilon = checkpoint["epsilon"]
+        self.lr = checkpoint["lr"]
 
     
 
@@ -245,9 +258,26 @@ def encode_obs(obs, agent_ids):
     ], axis=0)
     return feat
 
+def save_model(model, optimizer, global_step, epsilon, lr, path):
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "global_step": global_step,
+        "epsilon": epsilon,
+        "lr": lr,
+    }, path)
 
+def load_model(checkpoint, input_dim, num_actions, lr):
+    model = DQNModel(input_dim, num_actions)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    global_step = checkpoint["global_step"]
+    epsilon = checkpoint["epsilon"]
+    lr = checkpoint["lr"]
+    return model, optimizer, global_step, epsilon, lr
 
-def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, seed=86):
+def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, seed=86, save_model=True, pretrained_model=None):
     env = BomberEnv(max_steps=max_steps, seed=seed)
     if enemy_type == "simple":
         enemy_agent = SimpleRuleAgent(1)
@@ -268,14 +298,27 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
     epsilon_decay      = 0.995
     epsilon            = epsilon_start
     batch_size         = 64
+    lr                 = 1e-3
 
     dummy_obs = env.reset(seed=seed)
     agent_ids = [user_id, enemy_agent.agent_id]
     sample_state = encode_obs(dummy_obs, agent_ids=agent_ids)
     input_dim = len(sample_state)
     num_actions = 6
-    user_agent = DQNAgent(user_id, input_dim, num_actions, device="cuda" if torch.cuda.is_available() else "cpu")
+
+    
+    if pretrained_model:
+        checkpoint = torch.load(pretrained_model)
+        model, optimizer, global_step, epsilon, lr = load_model(checkpoint, input_dim, num_actions, 1e-3)
+        user_agent.q_net.load_state_dict(model.state_dict())
+        user_agent.optimizer.load_state_dict(optimizer.state_dict())
+        global_step = checkpoint["global_step"]
+        epsilon = checkpoint["epsilon"]
+        lr = checkpoint["lr"]
+
+    user_agent = DQNAgent(user_id, input_dim, num_actions, lr=lr, device="cuda" if torch.cuda.is_available() else "cpu")
     buffer = ReplayBuffer(capacity=10_000, state_dim=input_dim)
+
 
     global_step = 0
     with tqdm(total=num_episodes, desc="Training DQN") as pbar:
@@ -319,6 +362,15 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
                 user_agent.update_target_network()
             pbar.update(1)
             pbar.set_postfix(reward=f"{total_reward:.2f}", epsilon=f"{epsilon:.3f}")
+
+    if save_model:
+        model_path = f"models/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_{user_agent.global_step}_global_step.pth"
+        save_model(user_agent.q_net, 
+                    user_agent.optimizer, 
+                    user_agent.global_step, 
+                    user_agent.epsilon, 
+                    user_agent.lr, 
+                    model_path)
         
 
 if __name__ == "__main__":
@@ -327,5 +379,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_episodes", type=int, default=200, help="Number of episodes to train")
     parser.add_argument("--max_steps", type=int, default=500, help="Maximum number of steps per episode")
     parser.add_argument("--seed", type=int, default=86, help="Random seed for reproducibility")
+    parser.add_argument("--save_model", type=bool, default=True, help="Save model")
+    parser.add_argument("--load_model", type=str, default=None, help="Load model")
+    parser.add_argument("--skip_training", type=bool, default=False, help="Skip training")
     args = parser.parse_args()
-    train_dqn(enemy_type=args.enemy_type, num_episodes=args.num_episodes, max_steps=args.max_steps, seed=args.seed)
+    
+    if not args.skip_training:
+        train_dqn(enemy_type=args.enemy_type, num_episodes=args.num_episodes, max_steps=args.max_steps, seed=args.seed, save_model=args.save_model, pretrained_model=args.load_model)
+    
