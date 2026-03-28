@@ -9,13 +9,14 @@ import numpy as np
 import pygame
 import torch
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-	sys.path.append(str(ROOT_DIR))
+parent_dir = Path(__file__).resolve().parent.parent
+# Add parent directory to sys.path if not already present
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
 
-from engine.game import BomberEnv
+from engine import BomberEnv
 from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
-from training.DQN import DQNAgent, encode_obs
+from training import DQNAgent, encode_obs
 
 class Viewer:
 	def __init__(self, width=13, height=13, cell_size=42, fps=8):
@@ -246,7 +247,7 @@ def simulate_episodes(model_paths, num_episodes=10, max_steps=500, seed=None):
 			actions = []
 			for i in range(len(agents)):
 				if isinstance(agents[i], DQNAgent):
-					actions.append(agents[i].act(encoded_obs, epsilon=0.05))
+					actions.append(agents[i].act(*encoded_obs, epsilon=0.05))
 				else:
 					actions.append(agents[i].act(obs))
 			obs, terminated, truncated = env.step(actions)

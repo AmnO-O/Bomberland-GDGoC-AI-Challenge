@@ -34,6 +34,10 @@ REWARD_DICT = {
     "item_collection": 0.1,
     "danger_evasion": 0.12,
     "danger_enter": -0.06,
+    # Per step while alive inside predicted blast of a bomb you own (counters camping on own bomb)
+    "own_blast_loiter": -0.04,
+    # Multiplied by (prev_manhattan_dist - curr_dist) to nearest alive enemy
+    "approach_enemy": 0.02,
 }
 
 
@@ -115,6 +119,55 @@ def _enemy_alive_count(players, agent_id):
     )
 
 
+def _manhattan_to_nearest_alive_enemy(players, agent_id, x, y):
+    """None if there is no other alive player."""
+    best = None
+    ix, iy = int(x), int(y)
+    if isinstance(players, dict):
+        for pid, p in players.items():
+            if pid == agent_id or int(p[2]) != 1:
+                continue
+            d = abs(ix - int(p[0])) + abs(iy - int(p[1]))
+            best = d if best is None else min(best, d)
+        return best
+    arr = np.asarray(players)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    for pid in range(arr.shape[0]):
+        if pid == agent_id or int(arr[pid][2]) != 1:
+            continue
+        d = abs(ix - int(arr[pid][0])) + abs(iy - int(arr[pid][1]))
+        best = d if best is None else min(best, d)
+    return best
+
+
+def _in_own_predicted_blast(obs, agent_id, x, y):
+    bombs = obs["bombs"]
+    if bombs is None:
+        return False
+    arr = np.asarray(bombs)
+    if arr.size == 0:
+        return False
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    players = obs["players"]
+    grid = obs["map"]
+    ix, iy = int(x), int(y)
+    aid = int(agent_id)
+    for i in range(arr.shape[0]):
+        parsed = _parse_bomb_row(arr[i])
+        if parsed is None:
+            continue
+        bx, by, _timer, owner_id = parsed
+        if int(owner_id) != aid:
+            continue
+        radius = _bomb_radius_from_obs(players, owner_id)
+        tiles = _explosion_tiles_for_bomb(grid, bx, by, radius)
+        if (ix, iy) in tiles:
+            return True
+    return False
+
+
 def compute_reward(prev_obs, curr_obs, agent_id):
     if prev_obs is None:
         return 0.0
@@ -164,6 +217,19 @@ def compute_reward(prev_obs, curr_obs, agent_id):
         ):
             # Only when stepping into blast; standing still (e.g. planting on own tile) is excluded
             reward += REWARD_DICT["danger_enter"]
+
+    if curr_alive == 1 and _in_own_predicted_blast(curr_obs, agent_id, curr_x, curr_y):
+        reward += REWARD_DICT["own_blast_loiter"]
+
+    if (
+        curr_alive == 1
+        and prev_enemies_alive > 0
+        and curr_enemies_alive > 0
+    ):
+        prev_d = _manhattan_to_nearest_alive_enemy(prev_players, agent_id, prev_x, prev_y)
+        curr_d = _manhattan_to_nearest_alive_enemy(curr_players, agent_id, curr_x, curr_y)
+        if prev_d is not None and curr_d is not None:
+            reward += REWARD_DICT["approach_enemy"] * (prev_d - curr_d)
 
     # 3. ITEM COLLECTION
     # Based on your legend: 3 is item_radius, 4 is item_capacity
@@ -261,7 +327,12 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Plant Near Box Reward: {reward}")
-        expected = REWARD_DICT["standing_still"] + REWARD_DICT["time_penalty"] + REWARD_DICT["plant_near_box"]
+        expected = (
+            REWARD_DICT["standing_still"]
+            + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["plant_near_box"]
+            + REWARD_DICT["own_blast_loiter"]
+        )
         assert reward == expected, "Expected reward for planting near a box"
     
     def item_collection(self):
@@ -294,8 +365,12 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Agent Place Bomb (No Box) Reward: {reward}")
-        expected = REWARD_DICT["standing_still"] + REWARD_DICT["time_penalty"]
-        assert reward == expected, "Expected only standing/time penalties for useless bomb"
+        expected = (
+            REWARD_DICT["standing_still"]
+            + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["own_blast_loiter"]
+        )
+        assert reward == expected, "Expected standing/time + own-blast loiter for bomb on self"
 
     def danger_evasion_leave_blast(self):
         # Bomb at (2,2) radius 1 blasts (2,3); agent steps from (2,3) to (3,3).
@@ -312,10 +387,13 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Danger Evasion Reward: {reward}")
+        # Enemy at (0,0): Manhattan 5 -> 6 (one step away); approach term -1 * scale
+        approach = REWARD_DICT["approach_enemy"] * (5 - 6)
         expected = (
             -REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["danger_evasion"]
+            + approach
         )
         assert abs(reward - expected) < 1e-6, f"Expected ~{expected}, got {reward}"
 
@@ -333,10 +411,33 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Danger Evasion (urgent) Reward: {reward}")
+        approach = REWARD_DICT["approach_enemy"] * (5 - 6)
         expected = (
             -REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["danger_evasion"] * 1.5
+            + approach
+        )
+        assert abs(reward - expected) < 1e-6, f"Expected ~{expected}, got {reward}"
+
+    def approach_enemy_closer(self):
+        prev_obs = {
+            "map": np.zeros((3, 3), dtype=np.int8),
+            "players": {0: (0, 0, 1, 1, 0), 1: (2, 2, 1, 1, 0)},
+            "bombs": [],
+        }
+        curr_obs = {
+            "map": np.zeros((3, 3), dtype=np.int8),
+            "players": {0: (1, 1, 1, 1, 0), 1: (2, 2, 1, 1, 0)},
+            "bombs": [],
+        }
+        reward = compute_reward(prev_obs, curr_obs, agent_id=0)
+        print(f"Approach Enemy Reward: {reward}")
+        prev_d, curr_d = 4, 2
+        expected = (
+            -REWARD_DICT["standing_still"]
+            + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["approach_enemy"] * (prev_d - curr_d)
         )
         assert abs(reward - expected) < 1e-6, f"Expected ~{expected}, got {reward}"
 
@@ -354,10 +455,12 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Danger Enter Reward: {reward}")
+        approach = REWARD_DICT["approach_enemy"] * (6 - 5)
         expected = (
             -REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["danger_enter"]
+            + approach
         )
         assert abs(reward - expected) < 1e-6, f"Expected ~{expected}, got {reward}"
 
@@ -368,6 +471,7 @@ class UnitTestReward:
         self.agent_plant_near_box()
         self.item_collection()
         self.agent_place_bomb_no_box()
+        self.approach_enemy_closer()
         self.danger_evasion_leave_blast()
         self.danger_evasion_urgent_timer()
         self.danger_enter_blast()

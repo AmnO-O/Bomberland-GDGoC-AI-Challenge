@@ -18,8 +18,8 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from engine import *
-from reward import compute_reward
-from utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average
+from .reward import compute_reward
+from .utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average
 from agent import SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
 
 class ReplayBuffer:
@@ -394,8 +394,6 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
                 # 3. Reward
                 r = compute_reward(prev_obs, next_obs, agent_id=user_id)
                 total_reward += r
-                if not next_obs["players"][enemy_agent.agent_id][2]:
-                    r += 1.0
                 reward_history.append(r)
                 if done:
                     win_history.append(1 if next_obs["players"][user_id][2] else 0)
