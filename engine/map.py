@@ -16,7 +16,7 @@ class Map:
         self.width = width
         self.height = height
         self.rng = np.random.default_rng(seed)
-        self.box_spawn_probability = 0.5
+        self.box_spawn_probability = 0.3
         self.par = {}
         self.grid = np.zeros((height, width), dtype=int)
         self._setup_walls()

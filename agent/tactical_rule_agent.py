@@ -48,6 +48,17 @@ class TacticalRuleAgent:
 
         if my_pos in danger_now or my_pos in danger_soon:
             escape = self._best_escape_action(grid, my_pos, blocked, danger_now, danger_soon)
+            if escape is None:
+                escape = self._move_to_targets(
+                    grid, my_pos, self._safe_tiles(grid, danger_soon), blocked, danger_soon
+                )
+            if escape is None:
+                loose = [
+                    a
+                    for a in self._valid_actions(grid, my_pos, blocked)
+                    if a != 0 and self._next_pos(my_pos, a) not in danger_now
+                ]
+                escape = random.choice(loose) if loose else None
             return escape if escape is not None else 0
 
         item_tiles = self._item_tiles(
@@ -64,7 +75,7 @@ class TacticalRuleAgent:
             can_hit_enemy = self._can_bomb_hit_enemy(grid, my_pos, enemies, bomb_radius)
             boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
             if (can_hit_enemy or boxes_hit >= 1) and self._can_escape_after_placing(
-                grid, my_pos, blocked, danger_now, bomb_radius
+                grid, my_pos, blocked, danger_soon, bomb_radius # danger soon
             ):
                 return 5
 
@@ -140,10 +151,25 @@ class TacticalRuleAgent:
                 cnt += 1
         return cnt
 
+    def _safe_tiles(self, grid, danger_soon):
+        """
+        Return all tiles that are safe to move to.
+        A tile is safe to move to if it is not in danger_soon.
+        """
+        return {
+            (x, y)
+            for x in range(grid.shape[0])
+            for y in range(grid.shape[1])
+            if self._passable(grid, x, y) and (x, y) not in danger_soon
+        }
+
     def _best_escape_action(self, grid, my_pos, occupied, danger_now, danger_soon):
         best_action = None
         best_score = -10**9
         for a in self._valid_actions(grid, my_pos, occupied):
+            if a == 0:
+                # Timer may be >1: my_pos is in danger_soon but not danger_now — stay must not win.
+                continue
             npos = self._next_pos(my_pos, a)
             if npos in danger_now:
                 continue
@@ -224,9 +250,9 @@ class TacticalRuleAgent:
                 q.append((npos, d + 1, a if first_action is None else first_action))
         return None
 
-    def _can_escape_after_placing(self, grid, my_pos, occupied, existing_danger, bomb_radius):
+    def _can_escape_after_placing(self, grid, my_pos, occupied, danger_soon, bomb_radius):
         my_blast = self._blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-        combined = set(existing_danger) | my_blast
+        combined = set(danger_soon) | my_blast
         return self._move_to_nearest_safe(grid, my_pos, occupied, combined) is not None
 
     def _count_boxes_in_blast(self, grid, my_pos, radius):
