@@ -1,6 +1,16 @@
+"""Improved Imitation Learning: Behavioral Cloning Pre-training + DQfD Fine-tuning.
+
+Phase 1 — Behavioral Cloning: supervised cross-entropy on expert actions with
+          class weights, data augmentation, and validation monitoring.
+Phase 2 — DQfD Fine-tuning: combined TD loss + large-margin supervised loss
+          with real environment rewards and permanent demo replay.
+"""
+
 import argparse
 import sys
+import random
 from pathlib import Path
+
 parent_dir = Path(__file__).resolve().parent.parent
 if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
@@ -9,11 +19,14 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-from engine import BomberEnv
-from DQN import DQNAgent, ReplayBuffer, encode_obs, save_model_fn
+from engine import BomberEnv, Map, Player
 from reward import compute_reward
 from utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average
 from agent import (
@@ -21,7 +34,14 @@ from agent import (
     GeniusRuleAgent, BoxFarmerAgent,
 )
 
-EXPERT_AGENTS = {
+# ======================================================================
+# Reusable components (self-contained to avoid DQN.py import issues)
+# ======================================================================
+
+BOMB_MAX_TIMER = 7
+NUM_ACTIONS = 6
+
+AGENT_LOOKUP = {
     "genius":     GeniusRuleAgent,
     "tactical":   TacticalRuleAgent,
     "smarter":    SmarterRuleAgent,
@@ -29,254 +49,676 @@ EXPERT_AGENTS = {
     "box_farmer": BoxFarmerAgent,
 }
 
-ENEMY_AGENTS = EXPERT_AGENTS
 
-
-def _make_rule_agent(name: str, agent_id: int):
-    cls = EXPERT_AGENTS.get(name) or ENEMY_AGENTS.get(name)
+def _make_agent(name: str, agent_id: int):
+    cls = AGENT_LOOKUP.get(name)
     if cls is None:
         raise ValueError(f"Unknown agent type: {name}")
     return cls(agent_id)
 
 
-def collect_demonstrations(
-    expert_type: str,
-    opponent_type: str,
-    num_episodes: int,
-    max_steps: int,
-    seed: int,
-):
-    """Run an expert rule agent and record its transitions.
+class ReplayBuffer:
+    """Pre-allocated numpy circular buffer."""
 
-    The expert plays as player 0.  Each transition is stored with
-    reward = 1.0 (the SQIL signal for demonstration data).
+    def __init__(self, capacity: int, map_shape, aux_dim: int):
+        self.capacity = capacity
+        self.pos = 0
+        self.size = 0
+        self.map_shape = tuple(map_shape)
+        self.aux_dim = int(aux_dim)
+        self.map_states = np.zeros((capacity, *self.map_shape), dtype=np.float32)
+        self.aux_states = np.zeros((capacity, self.aux_dim), dtype=np.float32)
+        self.next_map_states = np.zeros((capacity, *self.map_shape), dtype=np.float32)
+        self.next_aux_states = np.zeros((capacity, self.aux_dim), dtype=np.float32)
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+
+    def __len__(self):
+        return self.size
+
+    def push(self, map_state, aux_state, action, reward,
+             next_map_state, next_aux_state, done):
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+        self.map_states[self.pos] = map_state
+        self.aux_states[self.pos] = aux_state
+        self.next_map_states[self.pos] = next_map_state
+        self.next_aux_states[self.pos] = next_aux_state
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.dones[self.pos] = done
+
+    def sample(self, batch_size: int):
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return (
+            self.map_states[idx], self.aux_states[idx],
+            self.next_map_states[idx], self.next_aux_states[idx],
+            self.actions[idx], self.rewards[idx], self.dones[idx],
+        )
+
+
+class DQNModel(nn.Module):
+    """Two-branch DQN: Conv2D for spatial features + MLP for scalars."""
+
+    def __init__(self, map_shape, aux_dim, output_dim):
+        super().__init__()
+        c, h, w = map_shape
+        self.map_encoder = nn.Sequential(
+            nn.Conv2d(c, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        with torch.no_grad():
+            conv_out_dim = self.map_encoder(torch.zeros(1, c, h, w)).reshape(1, -1).size(1)
+        self.aux_encoder = nn.Sequential(
+            nn.Linear(aux_dim, 32), nn.ReLU(),
+            nn.Linear(32, 32), nn.ReLU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(conv_out_dim + 32, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, output_dim),
+        )
+
+    def forward(self, map_x, aux_x):
+        map_feat = self.map_encoder(map_x).reshape(map_x.size(0), -1)
+        aux_feat = self.aux_encoder(aux_x)
+        return self.head(torch.cat([map_feat, aux_feat], dim=1))
+
+
+def encode_obs(obs, agent_ids):
+    """Encode raw observation into (map_feat [C,H,W], aux_feat [A,])."""
+    if obs is None:
+        raise ValueError("obs should not be None")
+    user_id = int(agent_ids[0])
+    opp_id = int(agent_ids[1]) if len(agent_ids) > 1 else (1 - user_id)
+
+    grid = obs["map"]
+    players = obs["players"]
+    bombs = obs["bombs"]
+    H, W = grid.shape
+
+    map_channels = [(grid == v).astype(np.float32)
+                    for v in (Map.GRASS, Map.WALL, Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY)]
+
+    my_x, my_y, my_alive, my_bombs_left, my_radius_bonus = players[user_id]
+    ox, oy, opp_alive, _, _ = players[opp_id]
+    my_pos = np.zeros((H, W), dtype=np.float32)
+    opp_pos = np.zeros((H, W), dtype=np.float32)
+    if int(my_alive) == 1:
+        my_pos[int(my_x), int(my_y)] = 1.0
+    if int(opp_alive) == 1:
+        opp_pos[int(ox), int(oy)] = 1.0
+
+    bomb_timer = np.zeros((H, W), dtype=np.float32)
+    bomb_owned = np.zeros((H, W), dtype=np.float32)
+    for b in bombs:
+        bx, by, timer, owner_id = b
+        bx, by = int(bx), int(by)
+        bomb_timer[bx, by] = max(bomb_timer[bx, by], float(timer) / BOMB_MAX_TIMER)
+        bomb_owned[bx, by] = 1.0 if int(owner_id) == user_id else 0.0
+
+    scalar = np.array([
+        float(my_bombs_left) / Player.MAX_BOMB_CAPACITY,
+        float(my_radius_bonus) / Player.MAX_BOMB_RADIUS,
+        float(opp_alive),
+    ], dtype=np.float32)
+
+    map_feat = np.stack([*map_channels, my_pos, opp_pos, bomb_timer, bomb_owned],
+                        axis=0).astype(np.float32)
+    return map_feat, scalar
+
+
+def save_model_fn(model, optimizer, global_step, epsilon, lr, input_spec,
+                  num_actions, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "global_step": global_step, "epsilon": epsilon, "lr": lr,
+        "input_dim": input_spec, "input_shape": input_spec,
+        "input_spec": input_spec, "num_actions": num_actions,
+    }, path)
+    print(f"Model saved to {path}")
+
+
+# ======================================================================
+# 1. Data Augmentation
+# ======================================================================
+
+_HFLIP_ACTION = np.array([0, 2, 1, 3, 4, 5], dtype=np.int64)
+_VFLIP_ACTION = np.array([0, 1, 2, 4, 3, 5], dtype=np.int64)
+_HVFLIP_ACTION = np.array([0, 2, 1, 4, 3, 5], dtype=np.int64)
+
+
+def augment_transition(map_state, aux_state, action):
+    """Return 3 augmented copies: h-flip, v-flip, hv-flip.
+
+    map_state: (C, H, W), aux_state: (A,), action: int
+    Returns list of (map, aux, action) tuples.
+    """
+    h_map = np.flip(map_state, axis=1).copy()
+    v_map = np.flip(map_state, axis=2).copy()
+    hv_map = np.flip(np.flip(map_state, axis=1), axis=2).copy()
+
+    return [
+        (h_map, aux_state.copy(), int(_HFLIP_ACTION[action])),
+        (v_map, aux_state.copy(), int(_VFLIP_ACTION[action])),
+        (hv_map, aux_state.copy(), int(_HVFLIP_ACTION[action])),
+    ]
+
+
+# ======================================================================
+# 2. Demonstration Collection (enhanced: win-filtering + real rewards)
+# ======================================================================
+
+def collect_demonstrations(expert_type, opponent_type, num_episodes,
+                           max_steps, seed, augment=True):
+    """Collect expert demonstrations, keeping only winning episodes.
 
     Returns
     -------
-    demo_buffer : ReplayBuffer
-        Filled buffer whose reward column is all 1.0.
+    bc_data : dict  with keys 'map', 'aux', 'action' — numpy arrays for BC
+    demo_buffer : ReplayBuffer  filled with real rewards for DQfD
     input_spec : tuple
-        (map_shape, aux_dim) inferred from the first observation.
     """
     env = BomberEnv(max_steps=max_steps, seed=seed)
-    expert = _make_rule_agent(expert_type, agent_id=0)
-    opponent = _make_rule_agent(opponent_type, agent_id=1)
+    expert = _make_agent(expert_type, agent_id=0)
+    opponent = _make_agent(opponent_type, agent_id=1)
     agent_ids = [0, 1]
 
     dummy_obs = env.reset(seed=seed)
     sample = encode_obs(dummy_obs, agent_ids)
     input_spec = (sample[0].shape, sample[1].shape[0])
 
-    capacity = num_episodes * max_steps
-    demo_buffer = ReplayBuffer(capacity=capacity, map_shape=input_spec[0], aux_dim=input_spec[1])
+    bc_maps, bc_auxs, bc_actions = [], [], []
+    capacity = num_episodes * max_steps * (4 if augment else 1)
+    demo_buffer = ReplayBuffer(capacity=capacity,
+                               map_shape=input_spec[0], aux_dim=input_spec[1])
 
-    total_transitions = 0
+    wins, total_eps = 0, 0
     for ep in tqdm(range(num_episodes), desc="Collecting demos"):
         obs = env.reset(seed=seed + ep)
         map_state, aux_state = encode_obs(obs, agent_ids)
+        prev_obs = None
+
+        ep_transitions = []
 
         for _ in range(max_steps):
             expert_action = expert.act(obs)
             opp_action = opponent.act(obs)
-            actions = [expert_action, opp_action]
-
-            next_obs, terminated, truncated = env.step(actions)
+            next_obs, terminated, truncated = env.step([expert_action, opp_action])
             done = terminated or truncated
 
             next_map_state, next_aux_state = encode_obs(next_obs, agent_ids)
-            demo_buffer.push(
-                map_state, aux_state,
-                expert_action, 1.0,
-                next_map_state, next_aux_state,
-                float(done),
-            )
-            total_transitions += 1
+            r = compute_reward(prev_obs, next_obs, agent_id=0)
 
+            ep_transitions.append((
+                map_state, aux_state, expert_action, r,
+                next_map_state, next_aux_state, float(done),
+            ))
+
+            prev_obs = obs
             obs = next_obs
             map_state = next_map_state
             aux_state = next_aux_state
-
             if done:
                 break
 
-    print(f"Collected {total_transitions} expert transitions "
-          f"({num_episodes} episodes, expert={expert_type}, opponent={opponent_type})")
-    return demo_buffer, input_spec
+        total_eps += 1
+        expert_alive = int(next_obs["players"][0][2]) == 1
+        opp_alive = int(next_obs["players"][1][2]) == 1
+        expert_won = expert_alive and not opp_alive
+
+        if not expert_won:
+            continue
+        wins += 1
+
+        for ms, axs, act, rew, nms, naxs, d in ep_transitions:
+            demo_buffer.push(ms, axs, act, rew, nms, naxs, d)
+            bc_maps.append(ms)
+            bc_auxs.append(axs)
+            bc_actions.append(act)
+
+            if augment:
+                for aug_ms, aug_axs, aug_act in augment_transition(ms, axs, act):
+                    bc_maps.append(aug_ms)
+                    bc_auxs.append(aug_axs)
+                    bc_actions.append(aug_act)
+
+    print(f"Demo collection: {wins}/{total_eps} winning episodes, "
+          f"{len(bc_maps)} BC samples (augmented), "
+          f"{len(demo_buffer)} replay transitions")
+
+    bc_data = {
+        "map": np.array(bc_maps, dtype=np.float32),
+        "aux": np.array(bc_auxs, dtype=np.float32),
+        "action": np.array(bc_actions, dtype=np.int64),
+    }
+    return bc_data, demo_buffer, input_spec
 
 
-def train_sqil(
-    user_id: int = 0,
-    expert_type: str = "tactical",
-    enemy_type: str = "tactical",
-    demo_episodes: int = 50,
-    num_episodes: int = 200,
-    max_steps: int = 500,
-    seed: int = 86,
-    save_model: bool = True,
+# ======================================================================
+# 3. Behavioral Cloning Pre-training
+# ======================================================================
+
+# STOP is common in expert data, BOMB is rare but critical
+BC_CLASS_WEIGHTS = torch.tensor([0.3, 1.0, 1.0, 1.0, 1.0, 2.0], dtype=torch.float32)
+
+
+def pretrain_bc(q_net, bc_data, device, bc_epochs=15, batch_size=128,
+                lr=1e-3, val_ratio=0.1):
+    """Train q_net via cross-entropy on expert actions.
+
+    Returns the best model state_dict (lowest val loss) and training history.
+    """
+    n = len(bc_data["action"])
+    idx = np.random.permutation(n)
+    split = int(n * (1 - val_ratio))
+    train_idx, val_idx = idx[:split], idx[split:]
+
+    weights = BC_CLASS_WEIGHTS.to(device)
+    optimizer = optim.AdamW(q_net.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6,
+    )
+
+    best_val_loss = float("inf")
+    best_state = None
+    bc_loss_history = []
+
+    for epoch in range(bc_epochs):
+        # ---- Train ----
+        q_net.train()
+        np.random.shuffle(train_idx)
+        train_loss_sum, train_correct, train_total = 0.0, 0, 0
+        action_correct = np.zeros(NUM_ACTIONS, dtype=np.int64)
+        action_total = np.zeros(NUM_ACTIONS, dtype=np.int64)
+
+        for start in range(0, len(train_idx), batch_size):
+            bi = train_idx[start:start + batch_size]
+            m = torch.from_numpy(bc_data["map"][bi]).to(device)
+            a = torch.from_numpy(bc_data["aux"][bi]).to(device)
+            labels = torch.from_numpy(bc_data["action"][bi]).to(device)
+
+            logits = q_net(m, a)
+            loss = F.cross_entropy(logits, labels, weight=weights)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += loss.item() * len(bi)
+            preds = logits.argmax(dim=1)
+            train_correct += (preds == labels).sum().item()
+            train_total += len(bi)
+
+            for act_id in range(NUM_ACTIONS):
+                mask = labels == act_id
+                action_total[act_id] += mask.sum().item()
+                action_correct[act_id] += ((preds == labels) & mask).sum().item()
+
+        train_loss = train_loss_sum / max(train_total, 1)
+        train_acc = train_correct / max(train_total, 1)
+        bc_loss_history.append(train_loss)
+
+        # ---- Validate ----
+        q_net.eval()
+        val_loss_sum, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for start in range(0, len(val_idx), batch_size):
+                bi = val_idx[start:start + batch_size]
+                m = torch.from_numpy(bc_data["map"][bi]).to(device)
+                a = torch.from_numpy(bc_data["aux"][bi]).to(device)
+                labels = torch.from_numpy(bc_data["action"][bi]).to(device)
+                logits = q_net(m, a)
+                loss = F.cross_entropy(logits, labels, weight=weights)
+                val_loss_sum += loss.item() * len(bi)
+                val_correct += (logits.argmax(1) == labels).sum().item()
+                val_total += len(bi)
+
+        val_loss = val_loss_sum / max(val_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in q_net.state_dict().items()}
+
+        act_names = ["STOP", "LEFT", "RIGHT", "UP", "DOWN", "BOMB"]
+        per_act = " | ".join(
+            f"{act_names[i]}: {action_correct[i] / max(action_total[i], 1):.2f}"
+            for i in range(NUM_ACTIONS)
+        )
+        print(f"  BC Epoch {epoch + 1:>2}/{bc_epochs} | "
+              f"train_loss={train_loss:.4f} acc={train_acc:.3f} | "
+              f"val_loss={val_loss:.4f} acc={val_acc:.3f} | {per_act}")
+
+    if best_state is not None:
+        q_net.load_state_dict(best_state)
+        q_net.to(device)
+    print(f"  BC done — best val loss: {best_val_loss:.4f}")
+    return bc_loss_history
+
+
+# ======================================================================
+# 4. DQfD Agent (TD loss + large-margin supervised loss)
+# ======================================================================
+
+class DQfDAgent:
+    """DQN agent with an additional large-margin classification loss for DQfD."""
+
+    def __init__(self, agent_id, input_spec, num_actions, lr=1e-3,
+                 device="cpu", margin=0.8):
+        self.agent_id = agent_id
+        self.num_actions = num_actions
+        self.device = device
+        self.gamma = 0.99
+        self.lr = lr
+        self.margin = margin
+        self.global_step = 0
+        self.epsilon = 1.0
+
+        self.map_shape = tuple(input_spec[0])
+        self.aux_dim = int(input_spec[1])
+        self.q_net = DQNModel(self.map_shape, self.aux_dim, num_actions).to(device)
+        self.target_net = DQNModel(self.map_shape, self.aux_dim, num_actions).to(device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr,
+                                    eps=1e-8, weight_decay=1e-5)
+
+    def act(self, map_state, aux_state, epsilon=0.0):
+        if random.random() < epsilon:
+            return random.randint(0, self.num_actions - 1)
+        m = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
+        a = torch.from_numpy(aux_state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.q_net(m, a).argmax().item()
+
+    def _to_device(self, *arrays):
+        tensors = [torch.from_numpy(a) for a in arrays]
+        if self.device != "cpu":
+            tensors = [t.to(self.device) for t in tensors]
+        return tensors
+
+    def dqfd_train_step(self, demo_batch, env_batch, lambda_bc):
+        """Combined DQfD update: TD loss on full batch + margin loss on demo half.
+
+        demo_batch / env_batch: each is a tuple of numpy arrays
+            (map, aux, next_map, next_aux, action, reward, done)
+
+        Returns (total_loss, td_loss, margin_loss) as floats.
+        """
+        d_ms, d_ax, d_nms, d_nax, d_act, d_rew, d_done = demo_batch
+        e_ms, e_ax, e_nms, e_nax, e_act, e_rew, e_done = env_batch
+        half = len(d_act)
+
+        all_ms = np.concatenate([d_ms, e_ms])
+        all_ax = np.concatenate([d_ax, e_ax])
+        all_nms = np.concatenate([d_nms, e_nms])
+        all_nax = np.concatenate([d_nax, e_nax])
+        all_act = np.concatenate([d_act, e_act])
+        all_rew = np.concatenate([d_rew, e_rew])
+        all_done = np.concatenate([d_done, e_done])
+
+        (ms_t, ax_t, nms_t, nax_t, act_t,
+         rew_t, done_t) = self._to_device(
+            all_ms, all_ax, all_nms, all_nax, all_act, all_rew, all_done)
+        act_t = act_t.long().unsqueeze(1)
+        rew_t = rew_t.unsqueeze(1)
+        done_t = done_t.unsqueeze(1)
+
+        # -- TD loss (full batch) --
+        q_all = self.q_net(ms_t, ax_t)
+        q_taken = q_all.gather(1, act_t)
+
+        with torch.no_grad():
+            max_next_q = self.target_net(nms_t, nax_t).max(1)[0].unsqueeze(1)
+            target_q = rew_t + self.gamma * max_next_q * (1 - done_t)
+
+        td_loss = F.mse_loss(q_taken, target_q)
+
+        # -- Large-margin classification loss (demo half only) --
+        q_demo = q_all[:half]
+        demo_actions = act_t[:half]
+        margins = torch.full_like(q_demo, self.margin)
+        margins.scatter_(1, demo_actions, 0.0)
+        max_q_margin = (q_demo + margins).max(dim=1)[0]
+        expert_q = q_demo.gather(1, demo_actions).squeeze(1)
+        margin_loss = (max_q_margin - expert_q).clamp(min=0).mean()
+
+        loss = td_loss + lambda_bc * margin_loss
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+        self.global_step += 1
+
+        return loss.item(), td_loss.item(), margin_loss.item()
+
+    def update_target_network(self):
+        self.target_net.load_state_dict(self.q_net.state_dict())
+
+
+# ======================================================================
+# 5. Main training loop
+# ======================================================================
+
+def train_dqfd(
+    user_id=0,
+    expert_type="genius",
+    enemy_type="simple",
+    demo_episodes=100,
+    bc_epochs=15,
+    num_episodes=300,
+    max_steps=500,
+    seed=86,
+    lambda_bc_init=1.0,
+    lambda_bc_final=0.1,
+    margin=0.8,
+    save_model=True,
     pretrained_model=None,
 ):
-    """Soft Q Imitation Learning.
-
-    Phase 1 — collect expert demonstrations (reward overridden to 1).
-    Phase 2 — train DQN where the agent's own transitions use reward 0,
-              and each mini-batch is 50 % demo / 50 % self-play.
-    """
-
     # ------------------------------------------------------------------
-    # Phase 1: demonstration collection
+    # Phase 0: Collect demonstrations
     # ------------------------------------------------------------------
-    demo_buffer, input_spec = collect_demonstrations(
+    bc_data, demo_buffer, input_spec = collect_demonstrations(
         expert_type=expert_type,
         opponent_type=enemy_type,
         num_episodes=demo_episodes,
         max_steps=max_steps,
         seed=seed,
+        augment=True,
     )
 
-    # ------------------------------------------------------------------
-    # Phase 2: SQIL training loop
-    # ------------------------------------------------------------------
-    env = BomberEnv(max_steps=max_steps, seed=seed)
-    enemy_agent = _make_rule_agent(enemy_type, agent_id=1)
-    agent_ids = [user_id, enemy_agent.agent_id]
-    num_actions = 6
-
-    epsilon_start = 0.5
-    epsilon_min   = 0.05
-    epsilon_decay = 0.995
-    epsilon       = epsilon_start
-    batch_size    = 64
-    half_batch    = batch_size // 2
-    lr            = 1e-3
+    if len(demo_buffer) == 0:
+        print("WARNING: no winning episodes collected — increase demo_episodes "
+              "or choose a weaker opponent")
+        return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    user_agent = DQNAgent(
-        user_id, input_spec, num_actions,
-        lr=lr, device=device, pretrained_model=pretrained_model,
-    )
 
-    env_buffer = ReplayBuffer(capacity=10_000, map_shape=input_spec[0], aux_dim=input_spec[1])
+    agent = DQfDAgent(user_id, input_spec, NUM_ACTIONS,
+                      lr=1e-3, device=device, margin=margin)
+
+    if pretrained_model:
+        ckpt = torch.load(pretrained_model, map_location=device)
+        agent.q_net.load_state_dict(ckpt["model_state_dict"])
+        agent.target_net.load_state_dict(ckpt["model_state_dict"])
+        print(f"Loaded pretrained weights from {pretrained_model}")
+
+    # ------------------------------------------------------------------
+    # Phase 1: Behavioral Cloning pre-training
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("Phase 1: Behavioral Cloning Pre-training")
+    print(f"{'='*60}")
+    bc_loss_history = pretrain_bc(
+        agent.q_net, bc_data, device,
+        bc_epochs=bc_epochs, batch_size=128, lr=1e-3,
+    )
+    agent.target_net.load_state_dict(agent.q_net.state_dict())
+    agent.optimizer = optim.Adam(agent.q_net.parameters(), lr=1e-3,
+                                 eps=1e-8, weight_decay=1e-5)
+
+    # ------------------------------------------------------------------
+    # Phase 2: DQfD fine-tuning with environment interaction
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("Phase 2: DQfD Fine-tuning")
+    print(f"{'='*60}")
+
+    env = BomberEnv(max_steps=max_steps, seed=seed)
+    enemy_agent = _make_agent(enemy_type, agent_id=1)
+    agent_ids = [user_id, enemy_agent.agent_id]
+
+    epsilon_start = 0.3
+    epsilon_min = 0.05
+    epsilon_decay = 0.995
+    epsilon = epsilon_start
+    batch_size = 64
+    half_batch = batch_size // 2
+
+    env_buffer = ReplayBuffer(capacity=20_000, map_shape=input_spec[0],
+                              aux_dim=input_spec[1])
 
     loss_history = []
+    td_loss_history = []
+    margin_loss_history = []
     reward_history = []
     win_history = []
+    ep_reward_history = []
 
-    with tqdm(total=num_episodes, desc="Training SQIL") as pbar:
+    with tqdm(total=num_episodes, desc="DQfD Training") as pbar:
         for ep in range(num_episodes):
             obs = env.reset(seed=seed + ep)
             map_state, aux_state = encode_obs(obs, agent_ids)
             prev_obs = None
             total_reward = 0.0
 
+            progress = ep / max(num_episodes - 1, 1)
+            lambda_bc = lambda_bc_init + (lambda_bc_final - lambda_bc_init) * progress
+
             for _ in range(max_steps):
-                user_action  = user_agent.act(map_state, aux_state, epsilon=epsilon)
+                user_action = agent.act(map_state, aux_state, epsilon=epsilon)
                 enemy_action = enemy_agent.act(obs)
                 actions = [None, None]
-                actions[user_id]              = user_action
+                actions[user_id] = user_action
                 actions[enemy_agent.agent_id] = enemy_action
 
                 next_obs, terminated, truncated = env.step(actions)
                 done = terminated or truncated
-
                 next_map_state, next_aux_state = encode_obs(next_obs, agent_ids)
-
-                # SQIL: agent's own experience gets reward = 0
-                env_buffer.push(
-                    map_state, aux_state,
-                    user_action, 0.0,
-                    next_map_state, next_aux_state,
-                    float(done),
-                )
 
                 r = compute_reward(prev_obs, next_obs, agent_id=user_id)
                 total_reward += r
                 reward_history.append(r)
+
+                env_buffer.push(map_state, aux_state, user_action, r,
+                                next_map_state, next_aux_state, float(done))
+
                 if done:
-                    win_history.append(1 if next_obs["players"][user_id][2] else 0)
+                    win_history.append(
+                        1 if next_obs["players"][user_id][2] else 0)
 
-                # Train once both buffers have enough data
-                if len(env_buffer) >= half_batch and len(demo_buffer) >= half_batch:
-                    d_map, d_aux, d_nmap, d_naux, d_act, d_rew, d_done = demo_buffer.sample(half_batch)
-                    e_map, e_aux, e_nmap, e_naux, e_act, e_rew, e_done = env_buffer.sample(half_batch)
+                if (len(env_buffer) >= half_batch
+                        and len(demo_buffer) >= half_batch):
+                    demo_batch = demo_buffer.sample(half_batch)
+                    env_batch = env_buffer.sample(half_batch)
 
-                    batch_map  = np.concatenate([d_map,  e_map],  axis=0)
-                    batch_aux  = np.concatenate([d_aux,  e_aux],  axis=0)
-                    batch_nmap = np.concatenate([d_nmap, e_nmap], axis=0)
-                    batch_naux = np.concatenate([d_naux, e_naux], axis=0)
-                    batch_act  = np.concatenate([d_act,  e_act],  axis=0)
-                    batch_rew  = np.concatenate([d_rew,  e_rew],  axis=0)
-                    batch_done = np.concatenate([d_done, e_done], axis=0)
+                    total_l, td_l, margin_l = agent.dqfd_train_step(
+                        demo_batch, env_batch, lambda_bc)
+                    loss_history.append(total_l)
+                    td_loss_history.append(td_l)
+                    margin_loss_history.append(margin_l)
 
-                    loss = user_agent.train_step(
-                        batch_map, batch_aux,
-                        batch_nmap, batch_naux,
-                        batch_act, batch_rew, batch_done,
-                    )
-                    loss_history.append(loss)
-
-                prev_obs  = obs
-                obs       = next_obs
+                prev_obs = obs
+                obs = next_obs
                 map_state = next_map_state
                 aux_state = next_aux_state
 
                 if done:
                     break
 
+            ep_reward_history.append(total_reward)
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
             if ep % 10 == 0:
-                user_agent.update_target_network()
+                agent.update_target_network()
             pbar.update(1)
-            pbar.set_postfix(reward=f"{total_reward:.2f}", epsilon=f"{epsilon:.3f}")
+            pbar.set_postfix(
+                reward=f"{total_reward:.2f}",
+                eps=f"{epsilon:.3f}",
+                lbc=f"{lambda_bc:.2f}",
+            )
 
     # ------------------------------------------------------------------
     # Save & plot
     # ------------------------------------------------------------------
-    tag = f"sqil_{expert_type}_{enemy_type}_{num_episodes}ep_{max_steps}steps_{seed}seed"
+    tag = (f"dqfd_{expert_type}_{enemy_type}_"
+           f"{num_episodes}ep_{max_steps}steps_{seed}seed")
     model_folder = f"ckpts/{tag}"
 
     if save_model:
-        model_path = f"{model_folder}/{user_agent.global_step}_global_step.pth"
-        save_model_fn(
-            user_agent.q_net, user_agent.optimizer,
-            user_agent.global_step, user_agent.epsilon,
-            user_agent.lr, input_spec, num_actions, model_path,
-        )
+        path = f"{model_folder}/{agent.global_step}_global_step.pth"
+        save_model_fn(agent.q_net, agent.optimizer, agent.global_step,
+                      agent.epsilon, agent.lr, input_spec, NUM_ACTIONS, path)
 
-    plot_loss(loss_history, save_path=f"{model_folder}/{tag}_loss.png")
-    plot_rewards(reward_history, save_path=f"{model_folder}/{tag}_rewards.png")
-    plot_win_rates(win_history, save_path=f"{model_folder}/{tag}_win_rates.png")
-    plot_moving_average(reward_history, window_size=10, save_path=f"{model_folder}/{tag}_moving_avg.png")
+    plot_loss(bc_loss_history,
+              save_path=f"{model_folder}/{tag}_bc_loss.png")
+    plot_loss(loss_history,
+              save_path=f"{model_folder}/{tag}_dqfd_loss.png")
+    plot_rewards(reward_history,
+                 save_path=f"{model_folder}/{tag}_rewards.png")
+    plot_win_rates(win_history,
+                   save_path=f"{model_folder}/{tag}_win_rates.png")
+    plot_moving_average(ep_reward_history, window_size=10,
+                        save_path=f"{model_folder}/{tag}_moving_avg.png")
 
+
+# ======================================================================
+# 6. CLI
+# ======================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Soft Q Imitation Learning (SQIL)")
-    parser.add_argument("--expert_type", type=str, default="tactical",
-                        choices=list(EXPERT_AGENTS.keys()),
+    parser = argparse.ArgumentParser(
+        description="Imitation Learning: BC Pre-training + DQfD Fine-tuning")
+    parser.add_argument("--expert_type", type=str, default="genius",
+                        choices=list(AGENT_LOOKUP.keys()),
                         help="Expert rule agent to imitate")
-    parser.add_argument("--enemy_type", type=str, default="tactical",
-                        choices=list(ENEMY_AGENTS.keys()),
-                        help="Opponent during RL training (and demo collection)")
-    parser.add_argument("--demo_episodes", type=int, default=50,
-                        help="Episodes of expert demonstrations to collect")
-    parser.add_argument("--num_episodes", type=int, default=200,
-                        help="RL training episodes")
+    parser.add_argument("--enemy_type", type=str, default="simple",
+                        choices=list(AGENT_LOOKUP.keys()),
+                        help="Opponent during demo collection and RL training")
+    parser.add_argument("--demo_episodes", type=int, default=100,
+                        help="Episodes of expert play to collect")
+    parser.add_argument("--bc_epochs", type=int, default=15,
+                        help="Behavioral cloning pre-training epochs")
+    parser.add_argument("--num_episodes", type=int, default=300,
+                        help="DQfD RL training episodes")
     parser.add_argument("--max_steps", type=int, default=500,
                         help="Maximum steps per episode")
     parser.add_argument("--seed", type=int, default=86,
                         help="Random seed for reproducibility")
+    parser.add_argument("--lambda_bc", type=float, default=1.0,
+                        help="Initial weight for supervised margin loss")
+    parser.add_argument("--margin", type=float, default=0.8,
+                        help="Large-margin value for DQfD classification loss")
     parser.add_argument("--save_model", action="store_true",
                         help="Save model checkpoint after training")
     parser.add_argument("--load_model", type=str, default=None,
                         help="Path to a pretrained model checkpoint")
     args = parser.parse_args()
 
-    train_sqil(
+    train_dqfd(
         expert_type=args.expert_type,
         enemy_type=args.enemy_type,
         demo_episodes=args.demo_episodes,
+        bc_epochs=args.bc_epochs,
         num_episodes=args.num_episodes,
         max_steps=args.max_steps,
         seed=args.seed,
+        lambda_bc_init=args.lambda_bc,
+        margin=args.margin,
         save_model=args.save_model,
         pretrained_model=args.load_model,
     )

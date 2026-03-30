@@ -18,8 +18,8 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from engine import *
-from reward import compute_reward
-from utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average
+from .reward import compute_reward
+from .utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average
 from agent import SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
 
 class ReplayBuffer:
