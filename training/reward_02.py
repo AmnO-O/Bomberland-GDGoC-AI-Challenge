@@ -47,9 +47,12 @@ R_SAFE_NEAR_BOMB = 0.002
 R_PLANT_BOMB_TACTICAL = 0.05
 R_PLANT_BOMB_UNSAFE = -0.08
 R_OWN_BOMB_BLAST_PENALTY = -0.01
+R_IDLE_STREAK_PENALTY_PER_STEP = -0.004
+R_IDLE_STREAK_PENALTY_CAP = -0.04
 
 # Manhattan distance to nearest bomb center to count as "bomb nearby" when safe
 SAFE_NEAR_BOMB_RADIUS = 4
+IDLE_STREAK_GRACE_STEPS = 6
 
 # Anti–reward-hacking: dense shaping cap per episode, decay with time, and
 # movement bonuses only when improving global best distance to an enemy.
@@ -69,11 +72,15 @@ class EpisodeRewardState:
     best_dist: Optional[float] = None
     step_idx: int = 0
     dense_cumulative: float = 0.0
+    idle_streak: int = 0
+    last_pos: Optional[Tuple[int, int]] = None
 
     def reset(self) -> None:
         self.best_dist = None
         self.step_idx = 0
         self.dense_cumulative = 0.0
+        self.idle_streak = 0
+        self.last_pos = None
 
 
 def _box_count(obs) -> int:
@@ -247,6 +254,32 @@ def compute_reward_icec(
     moved = prev_x != curr_x or prev_y != curr_y
 
     dense_pos_this_step = 0.0
+
+    # Anti-camping: penalize repeated idling only when enemies are still alive and
+    # there is no immediate bomb context to justify waiting.
+    if curr_alive == 1 and curr_enemies_alive > 0:
+        if moved:
+            episode_state.idle_streak = 0
+        else:
+            if episode_state.last_pos == (curr_x, curr_y):
+                episode_state.idle_streak += 1
+            else:
+                episode_state.idle_streak = 1
+        episode_state.last_pos = (curr_x, curr_y)
+        if (
+            episode_state.idle_streak > IDLE_STREAK_GRACE_STEPS
+            and not _any_bombs(curr_obs)
+        ):
+            over = episode_state.idle_streak - IDLE_STREAK_GRACE_STEPS
+            v = max(
+                R_IDLE_STREAK_PENALTY_CAP,
+                R_IDLE_STREAK_PENALTY_PER_STEP * float(over),
+            )
+            reward += v
+            _add_comp("idle_streak_penalty", float(v))
+    else:
+        episode_state.idle_streak = 0
+        episode_state.last_pos = (curr_x, curr_y)
 
     if curr_alive == 1 and moved:
         prev_d = _manhattan_to_nearest_alive_enemy(prev_players, agent_id, prev_x, prev_y)
