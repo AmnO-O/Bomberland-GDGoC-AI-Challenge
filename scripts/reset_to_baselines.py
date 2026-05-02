@@ -46,14 +46,10 @@ def _collect_state(conn: sqlite3.Connection, delete_empty_teams: bool) -> tuple[
     nonbaseline_submission_ids = [row[0] for row in cursor.fetchall()]
     nonbaseline_set = set(nonbaseline_submission_ids)
 
-    cursor.execute("SELECT match_id, player_submission_ids_csv FROM match_results")
+    cursor.execute("SELECT match_id FROM match_results")
     match_rows = cursor.fetchall()
-    match_ids_to_delete: list[str] = []
-    for match_id, csv_ids in match_rows:
-        players = _csv_ids(csv_ids)
-        # Delete if ANY player is not a known baseline
-        if not all(player_id in baseline_set for player_id in players):
-            match_ids_to_delete.append(match_id)
+    match_ids_to_delete: list[str] = [row[0] for row in match_rows]
+
 
     team_ids_to_delete: list[str] = []
     quota_rows_to_delete = 0
