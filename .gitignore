@@ -4,3 +4,9 @@ logs/
 .venv
 ckpts/
 .vscode/
+*.db
+.pytest_cache/
+.env
+secrets/
+submissions/
+.drive_locks/
