@@ -15,15 +15,16 @@ pygame = importlib.import_module("pygame")
 
 
 class ReplayViewer:
-    def __init__(self, history, title="Bomberland Replay", fps=8):
+    def __init__(self, history, meta=None, title="Bomberland Replay", fps=8):
         self.history = history
+        self.meta = meta or {}
         self.fps = fps
         self.paused = False
         self.step_idx = 0
         self.last_tick = time.time()
 
         first = history[0]
-        frame = render_match_frame(self._make_obs(first), prev_obs=None)
+        frame = render_match_frame(self._make_obs(first), prev_obs=None, agent_metadata=self.meta)
         self.screen_width, self.screen_height = frame.size
 
         pygame.init()
@@ -46,7 +47,7 @@ class ReplayViewer:
         prev_entry = self.history[step_idx - 1] if step_idx > 0 else None
         current_obs = self._make_obs(current_entry)
         prev_obs = self._make_obs(prev_entry) if prev_entry is not None else None
-        image = render_match_frame(current_obs, prev_obs=prev_obs)
+        image = render_match_frame(current_obs, prev_obs=prev_obs, agent_metadata=self.meta)
         return pygame.image.fromstring(image.tobytes(), image.size, image.mode)
 
     def run(self):
@@ -107,7 +108,13 @@ class ReplayViewer:
 def load_history(json_path):
     with open(json_path, "r") as handle:
         payload = json.load(handle)
-    return payload["history"]
+    history = payload.get("history", [])
+    meta = payload.get("meta") or {}
+    if "agent_names" not in meta:
+        team_ids = payload.get("team_ids") or []
+        if team_ids:
+            meta = {**meta, "agent_names": team_ids}
+    return history, meta
 
 
 if __name__ == "__main__":
@@ -117,9 +124,10 @@ if __name__ == "__main__":
     parser.add_argument("--paused", action="store_true", help="Start paused")
     args = parser.parse_args()
 
-    history = load_history(args.json_path)
+    history, meta = load_history(args.json_path)
     viewer = ReplayViewer(
         history=history,
+        meta=meta,
         title=f"Bomberland Replay - {Path(args.json_path).name}",
         fps=args.fps,
     )

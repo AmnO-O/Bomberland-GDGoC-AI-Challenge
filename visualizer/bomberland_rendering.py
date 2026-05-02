@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 
 TOP_BAR_HEIGHT = 48
@@ -47,18 +47,23 @@ def explosion_tiles_from_transition(prev_obs, curr_obs):
     return tiles
 
 
-def render_match_frame(obs, prev_obs=None, cell_size=40, top_bar_height=TOP_BAR_HEIGHT):
+def render_match_frame(obs, prev_obs=None, cell_size=40, top_bar_height=TOP_BAR_HEIGHT, agent_metadata=None):
     width = len(obs["map"][0])
     height = len(obs["map"])
 
-    img = Image.new("RGBA", (width * cell_size, height * cell_size + top_bar_height), (245, 245, 245, 255))
+    # Right-side panel width (for agent names, colors, bombs, radius)
+    RIGHT_PANEL_WIDTH = 340
+    board_width = width * cell_size
+    total_width = board_width + RIGHT_PANEL_WIDTH
+
+    img = Image.new("RGBA", (total_width, height * cell_size + top_bar_height), (245, 245, 245, 255))
     draw = ImageDraw.Draw(img, "RGBA")
 
-    draw.rectangle([0, 0, width * cell_size, top_bar_height], fill=(30, 30, 30))
+    draw.rectangle([0, 0, board_width, top_bar_height], fill=(30, 30, 30))
     _draw_text(draw, (10, 14), f"Step {int(obs.get('_step', 0))}", fill=(245, 245, 245))
 
     board_top = top_bar_height
-    draw.rectangle([0, board_top, width * cell_size, board_top + height * cell_size], fill=(144, 238, 144))
+    draw.rectangle([0, board_top, board_width, board_top + height * cell_size], fill=(144, 238, 144))
 
     grid = obs["map"]
     for row in range(height):
@@ -103,7 +108,8 @@ def render_match_frame(obs, prev_obs=None, cell_size=40, top_bar_height=TOP_BAR_
         draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=(20, 20, 20), outline=(0, 0, 0))
         _draw_text(draw, (cx - 5, cy - 8), str(timer), fill=(255, 255, 255))
 
-    colors = [(255, 255, 0), (0, 255, 255), (255, 0, 255), (0, 255, 0)]
+    # match colors used in run_local_evaluation.Viewer.PLAYER_COLORS
+    colors = [(220, 50, 50), (50, 50, 220), (30, 150, 30), (200, 140, 0)]
     for i, p in enumerate(obs.get("players", [])):
         if not p[2]:
             continue
@@ -116,5 +122,68 @@ def render_match_frame(obs, prev_obs=None, cell_size=40, top_bar_height=TOP_BAR_
         ]
         draw.ellipse(rect, fill=colors[i % len(colors)], outline=(0, 0, 0))
         _draw_text(draw, (col * cell_size + 15, board_top + row * cell_size + 15), str(i), fill=(0, 0, 0))
+
+    # --- Right-side agent panel (styled like run_local_evaluation) ---
+    panel_x0 = board_width
+    panel_y0 = top_bar_height
+    panel_x1 = total_width
+    panel_y1 = panel_y0 + height * cell_size
+    panel_bg = (52, 58, 64)
+    draw.rectangle([panel_x0, panel_y0, panel_x1, panel_y1], fill=panel_bg)
+    draw.line([panel_x0, 0, panel_x0, panel_y1], fill=(30, 30, 30), width=2)
+
+    # Title
+    try:
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+        font_small = ImageFont.truetype("DejaVuSans.ttf", 14)
+        font_status = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+        font_status = ImageFont.load_default()
+
+    title_text = "Agents"
+    draw.text((panel_x0 + 10, panel_y0 + 8), title_text, fill=(245, 245, 245), font=font_title)
+
+    players = obs.get("players", [])
+    n_players = len(players)
+    meta_names = []
+    meta_colors = None
+    if agent_metadata:
+        meta_names = agent_metadata.get("agent_names") or agent_metadata.get("team_ids") or []
+        meta_colors = agent_metadata.get("colors")
+    if not meta_names or len(meta_names) < n_players:
+        meta_names = [f"Agent {i}" for i in range(n_players)]
+
+    y = panel_y0 + 40
+    line_h = 22
+    for i in range(n_players):
+        name = meta_names[i] if i < len(meta_names) and meta_names[i] else f"Agent {i}"
+        p = players[i] if i < len(players) else [0, 0, 0, 0, 0]
+        alive = int(p[2]) == 1
+        bombs_left = int(p[3]) if len(p) > 3 else 0
+        radius_bonus = int(p[4]) if len(p) > 4 else 0
+        color = tuple(meta_colors[i]) if (meta_colors and i < len(meta_colors)) else colors[i % len(colors)]
+
+        # small colored circle
+        cx = panel_x0 + 14
+        cy = y + 8
+        draw.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=color)
+
+        # name (trim)
+        name_str = str(name)[:40]
+        draw.text((panel_x0 + 28, y), name_str, fill=(240, 240, 240), font=font_small)
+        y += line_h
+
+        # status
+        status = "Alive" if alive else "Dead"
+        status_color = (120, 220, 140) if alive else (220, 100, 100)
+        draw.text((panel_x0 + 10, y), status, fill=status_color, font=font_status)
+        y += line_h
+
+        # stats line
+        stats = f"Bombs: {bombs_left}  |  +Radius: {radius_bonus}"
+        draw.text((panel_x0 + 10, y), stats, fill=(200, 200, 200), font=font_small)
+        y += line_h + 6
 
     return img.convert("RGB")
