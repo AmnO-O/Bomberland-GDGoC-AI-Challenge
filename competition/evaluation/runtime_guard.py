@@ -1,5 +1,6 @@
 import importlib.util
 import multiprocessing as mp
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,12 +10,32 @@ from engine.game import BomberEnv
 
 
 def load_agent_instance(agent_path: str, agent_id: int):
-    spec = importlib.util.spec_from_file_location("Agent", agent_path)
+    # Add the submission directory to sys.path so that helper modules bundled
+    # alongside agent.py (e.g. reward.py, utils.py, model.py) can be imported
+    # normally with plain `import reward` or `from utils import ...`.
+    # We insert at position 0 so submission-local modules take priority over any
+    # global package with the same name, and we avoid adding duplicates.
+    agent_dir = str(Path(agent_path).parent)
+    if agent_dir not in sys.path:
+        sys.path.insert(0, agent_dir)
+
+    # Use the module name "agent" (matching the filename) so that helper modules
+    # which do `from agent import X` find THIS module in sys.modules instead of
+    # triggering a fresh re-load.  Pre-registering before exec_module is the
+    # standard Python pattern for breaking circular imports: subsequent imports
+    # of "agent" during execution will receive the partially-initialized module
+    # rather than starting a second, conflicting load of agent.py.
+    spec = importlib.util.spec_from_file_location("agent", agent_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module spec: {agent_path}")
 
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules["agent"] = module   # pre-register before exec to break circular imports
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop("agent", None)  # clean up so the next load starts fresh
+        raise
 
     if hasattr(module, "Agent") and isinstance(getattr(module, "Agent"), type):
         agent_cls = getattr(module, "Agent")

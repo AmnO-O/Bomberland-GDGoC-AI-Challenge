@@ -52,6 +52,12 @@ secret_value_0 = user_secrets.get_secret("dqn")
 !python /kaggle/working/Bomberland-GDGoC-AI-Challenge/agent/dqn_agent/agent.py --enemy_type tactical --num_episodes 10000 --save_model
 ```
 
+**Tips**: To successfully submit your RL-based agent:
+* Keep training code inside `if __name__ == "__main__":`
+* Use `Path(__file__).parent` to load weights
+* Zip your files flat (not inside a folder)
+* **Or better:** keep only agent.py with class Agent and init & act methods and weights file in the same folder
+
 ## 🧪 Local Testing
 
 Guidance for local testing before submitting your agent. All participant scripts are located in the `scripts/participant/` folder.

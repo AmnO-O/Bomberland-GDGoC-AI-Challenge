@@ -8,16 +8,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-import sys
-from pathlib import Path
-root_dir = Path(__file__).resolve().parent.parent.parent
-# Add parent directory to sys.path if not already present
-if str(root_dir) not in sys.path:
-    sys.path.insert(0, str(root_dir))
-from reward import compute_reward
-from utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average, seed_everything, save_model_fn
-from agent import SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
-from engine import BomberEnv
 
 # Constants from engine
 class Map:
@@ -120,68 +110,64 @@ class DQNModel(nn.Module):
         return self.head(feat)
 
 def encode_obs(obs, agent_ids):
-    """Encode raw observation into (map_feat [C,H,W], aux_feat [A,])."""
+    """
+    Returns:
+      map_feat: spatial tensor for Conv2D branch, shape (C, H, W)
+      aux_feat: scalar tensor for auxiliary branch, shape (A,)
+
+    agent_ids: int (user's player id) or list/tuple [user_id, opp_id].
+    When a single int is given the enemy is inferred as the other
+    player in a 2-player game (1 - user_id).
+    """
     if obs is None:
         raise ValueError("obs should not be None")
+
+    # Normalise agent_ids to (user_id, opp_id)
     user_id = int(agent_ids[0])
-    players = obs["players"]
-    num_players = int(players.shape[0])
+    opp_id  = int(agent_ids[1]) if len(agent_ids) > 1 else (1 - user_id)
 
-    if len(agent_ids) > 1:
-        ordered_ids = [int(i) for i in agent_ids]
-    else:
-        ordered_ids = [user_id] + [i for i in range(num_players) if i != user_id]
+    grid    = obs["map"]      # (H, W)
+    players = obs["players"]  # (num_players, 5)
+    bombs   = obs["bombs"]    # (N, 4), N may be 0
+    H, W    = grid.shape
 
-    opp_ids = [i for i in ordered_ids[1:] if i != user_id]
-    while len(opp_ids) < 3:
-        opp_ids.append(-1)
-
-    grid = obs["map"]
-    bombs = obs["bombs"]
-    H, W = grid.shape
-
-    map_channels = [(grid == v).astype(np.float32) for v in (
-        Map.GRASS, Map.WALL, Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY)]
-
+    # One-hot map: grass, wall, box, item_radius, item_capacity
+    map_channels = []
+    for v in [Map.GRASS, Map.WALL, Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY]:
+        map_channels.append((grid == v).astype(np.float32))
+    # Player position masks
     my_x, my_y, my_alive, my_bombs_left, my_radius_bonus = players[user_id]
-    my_pos = np.zeros((H, W), dtype=np.float32)
-    if int(my_alive) == 1:
+    ox,   oy,   opp_alive, _,            _               = players[opp_id]
+    my_pos  = np.zeros((H, W), dtype=np.float32)
+    opp_pos = np.zeros((H, W), dtype=np.float32)
+    if int(my_alive)  == 1:
         my_pos[int(my_x), int(my_y)] = 1.0
+    if int(opp_alive) == 1:
+        opp_pos[int(ox), int(oy)]    = 1.0
 
-    opp_pos_planes = []
-    opp_alive_flags = []
-    for oid in opp_ids[:3]:
-        plane = np.zeros((H, W), dtype=np.float32)
-        alive_flag = 0.0
-        if 0 <= oid < num_players:
-            ox, oy, o_alive, _, _ = players[oid]
-            if int(o_alive) == 1:
-                plane[int(ox), int(oy)] = 1.0
-                alive_flag = 1.0
-        opp_pos_planes.append(plane)
-        opp_alive_flags.append(alive_flag)
-
+    # Bomb channels — bombs is a numpy array, not a list of Bomb objects
     bomb_timer = np.zeros((H, W), dtype=np.float32)
     bomb_owned = np.zeros((H, W), dtype=np.float32)
     for b in bombs:
         bx, by, timer, owner_id = b
         bx, by = int(bx), int(by)
-        bomb_timer[bx, by] = max(bomb_timer[bx, by], float(timer) / BOMB_MAX_TIMER)
+        t = float(timer) / BOMB_MAX_TIMER  # normalise by default max timer
+        bomb_timer[bx, by] = max(bomb_timer[bx, by], t)
         bomb_owned[bx, by] = 1.0 if int(owner_id) == user_id else 0.0
 
     scalar = np.array([
-        float(my_bombs_left) / Player.MAX_BOMB_CAPACITY,
+        float(my_bombs_left)   / Player.MAX_BOMB_CAPACITY,
         float(my_radius_bonus) / Player.MAX_BOMB_RADIUS,
-        *opp_alive_flags[:3],
+        float(opp_alive),
     ], dtype=np.float32)
 
     map_feat = np.stack([
-        *map_channels,
-        my_pos,
-        *opp_pos_planes[:3],
-        bomb_timer,
-        bomb_owned,
-    ], axis=0).astype(np.float32)
+        *map_channels,          # 5 channels
+        my_pos,                 # 1 channel
+        opp_pos,                # 1 channel
+        bomb_timer,             # 1 channel
+        bomb_owned,             # 1 channel
+    ], axis=0).astype(np.float32)  # (9, H, W)
     return map_feat, scalar
 
 class TrainingAgent:
@@ -314,6 +300,19 @@ class TrainingAgent:
         self.epsilon = checkpoint["epsilon"]
 
 def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, seed=86, save_model=True, pretrained_model=None):
+    # Training-only imports - placed here so they don't run when the evaluator loads this file
+    import sys as _sys
+    from pathlib import Path as _Path
+    _root = _Path(__file__).resolve().parent.parent.parent
+    if str(_root) not in _sys.path:
+        _sys.path.insert(0, str(_root))
+    from reward import compute_reward  
+    from utils import (plot_loss, plot_rewards, plot_win_rates, 
+                       plot_moving_average, seed_everything, save_model_fn)
+    from agent import (SimpleRuleAgent, SmarterRuleAgent, 
+                       TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent)
+    from engine import BomberEnv 
+
     env = BomberEnv(max_steps=max_steps, seed=seed)
     if enemy_type == "simple":
         enemy_agent = SimpleRuleAgent(1)
@@ -499,7 +498,7 @@ class Agent:
         """
         try:
             # Encode observation
-            map_state, aux_state = encode_obs(obs, self.agent_id)
+            map_state, aux_state = encode_obs(obs, [self.agent_id])
             
             # Convert to tensors and add batch dimension
             map_tensor = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
