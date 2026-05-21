@@ -122,6 +122,12 @@ def process_registration_payload(payload: Mapping[str, Any], store: SubmissionSt
             "error_code": "MISSING_STUDENT_ID_1",
             "message": "Student ID for Student 1 is required.",
         }
+    if not majors:
+        return {
+            "status": "error",
+            "error_code": "MISSING_MAJORS",
+            "message": "Majors information is required.",
+        }
     if not _agreement_checked(agreement_raw):
         return {
             "status": "error",
