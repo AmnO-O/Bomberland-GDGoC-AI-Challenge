@@ -40,18 +40,26 @@ def get_drive_service():
 
 def list_date_folders(service, json_folder_id: str) -> list[dict]:
     """List all date subfolders inside the json/ Drive folder."""
+    import time
     folders = []
     page_token = None
     while True:
-        resp = service.files().list(
-            q=f"'{json_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            fields="files(id, name), nextPageToken",
-            pageSize=100,
-            orderBy="name",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageToken=page_token,
-        ).execute()
+        for attempt in range(4):
+            try:
+                resp = service.files().list(
+                    q=f"'{json_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                    fields="files(id, name), nextPageToken",
+                    pageSize=100,
+                    orderBy="name",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    pageToken=page_token,
+                ).execute()
+                break
+            except Exception as e:
+                if attempt == 3: raise
+                time.sleep(2)
+                
         folders.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -61,17 +69,25 @@ def list_date_folders(service, json_folder_id: str) -> list[dict]:
 
 def list_files_in_folder(service, folder_id: str) -> list[dict]:
     """List all files in a Drive folder with pagination."""
+    import time
     files = []
     page_token = None
     while True:
-        resp = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id, name, size), nextPageToken",
-            pageSize=1000,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageToken=page_token,
-        ).execute()
+        for attempt in range(4):
+            try:
+                resp = service.files().list(
+                    q=f"'{folder_id}' in parents and trashed=false",
+                    fields="files(id, name, size), nextPageToken",
+                    pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    pageToken=page_token,
+                ).execute()
+                break
+            except Exception as e:
+                if attempt == 3: raise
+                time.sleep(2)
+                
         files.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -165,12 +181,20 @@ def run_pipeline(
     drive_folder_id = os.getenv("DRIVE_FOLDER_ID", "")
 
     # Find json/ folder
-    resp = service.files().list(
-        q=f"'{drive_folder_id}' in parents and name='json' and mimeType='application/vnd.google-apps.folder' and trashed=false",
-        fields="files(id)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
+    import time
+    for attempt in range(4):
+        try:
+            resp = service.files().list(
+                q=f"'{drive_folder_id}' in parents and name='json' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            break
+        except Exception as e:
+            if attempt == 3: raise
+            time.sleep(2)
+            
     json_folder_id = resp["files"][0]["id"]
 
     # List date folders
