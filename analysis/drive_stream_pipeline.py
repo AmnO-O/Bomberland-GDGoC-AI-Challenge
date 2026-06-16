@@ -207,7 +207,6 @@ def run_pipeline(
             if in_memory:
                 import concurrent.futures
                 import threading
-                import time
 
                 thread_local = threading.local()
 
