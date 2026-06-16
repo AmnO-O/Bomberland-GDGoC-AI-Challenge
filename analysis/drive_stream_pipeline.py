@@ -259,6 +259,12 @@ def run_pipeline(
                         if completed % 100 == 0:
                             print(f"    {completed}/{n_to_process} downloaded+processed")
 
+                # Recreate the Google Drive service for the main thread.
+                # When the ProcessPoolExecutor forks and then tears down child processes, 
+                # they close the duplicated SSL socket file descriptors, causing a BrokenPipeError 
+                # in the main thread's next API call. Re-initializing fixes this.
+                service = get_drive_service()
+
             else:
                 # Disk-based processing (for very large files or debugging)
                 tmp_path.mkdir(parents=True, exist_ok=True)
