@@ -108,6 +108,46 @@ def download_file_to_disk(service, file_id: str, dest_path: str):
             _, done = downloader.next_chunk()
 
 
+_process_service = None
+
+def _process_single_file_task(args):
+    """Worker task for multiprocessing."""
+    file_info, date_str = args
+    global _process_service
+    import sys
+    import json
+    import time
+    from pathlib import Path
+    from analysis.extract_match_metrics import extract_metrics
+    
+    for attempt in range(3):
+        try:
+            if _process_service is None:
+                _process_service = get_drive_service()
+            svc = _process_service
+            
+            content = download_file_content(svc, file_info["id"])
+            data = json.loads(content)
+            rows = extract_metrics(data)
+
+            fname = Path(file_info["name"]).stem
+            parts = fname.split("_")
+            file_date = ""
+            if len(parts) >= 2 and len(parts[1]) == 8:
+                raw = parts[1]
+                file_date = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+
+            for row in rows:
+                row["match_id"] = fname
+                row["date"] = file_date or date_str
+            return rows
+        except Exception as e:
+            if attempt == 2:
+                print(f"    WARN: {file_info['name']}: {e}", file=sys.stderr)
+                return []
+            time.sleep(1 + attempt * 2)
+
+
 def run_pipeline(
     sample_rate: float = 0.10,
     start_date: str = "",
@@ -206,46 +246,12 @@ def run_pipeline(
 
             if in_memory:
                 import concurrent.futures
-                import threading
-
-                thread_local = threading.local()
-
-                def get_thread_service():
-                    if not hasattr(thread_local, "service"):
-                        thread_local.service = get_drive_service()
-                    return thread_local.service
-
-                def process_single_file(file_info):
-                    for attempt in range(3):
-                        try:
-                            svc = get_thread_service()
-                            content = download_file_content(svc, file_info["id"])
-                            data = json.loads(content)
-                            rows = extract_metrics(data)
-
-                            fname = Path(file_info["name"]).stem
-                            parts = fname.split("_")
-                            file_date = ""
-                            if len(parts) >= 2 and len(parts[1]) == 8:
-                                raw = parts[1]
-                                file_date = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
-
-                            for row in rows:
-                                row["match_id"] = fname
-                                row["date"] = file_date or date_str
-                            return rows
-                        except Exception as e:
-                            if attempt == 2:
-                                print(f"    WARN: {file_info['name']}: {e}", file=sys.stderr)
-                                return []
-                            time.sleep(1 + attempt * 2)
 
                 completed = 0
-                # Using 10 workers avoids hitting the Google Drive API rate limits
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = {executor.submit(process_single_file, fi): fi for fi in json_files}
-                    for future in concurrent.futures.as_completed(futures):
-                        rows = future.result()
+                # Using ProcessPoolExecutor to avoid Segfaults with OpenBLAS / scipy.stats in threads
+                with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+                    tasks = [(fi, date_str) for fi in json_files]
+                    for rows in executor.map(_process_single_file_task, tasks):
                         for row in rows:
                             writer.writerow(row)
                             day_rows += 1
