@@ -144,10 +144,19 @@ def run_pipeline(
         date_folders = [df for df in date_folders if df["name"] <= end_date]
     print(f"Processing {len(date_folders)} date folders (sample_rate={sample_rate:.0%})")
 
-    # Setup output CSV
+    # Setup output CSV and load existing for safe resume
     output_path = Path(output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not output_path.exists() or output_path.stat().st_size == 0
+    
+    processed_match_ids = set()
+    if output_path.exists() and output_path.stat().st_size > 0:
+        with open(output_csv, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if "match_id" in row:
+                    processed_match_ids.add(row["match_id"])
+        print(f"Found {len(processed_match_ids)} previously processed matches. Resuming safely.")
 
     tmp_path = Path(tmp_dir)
 
@@ -167,45 +176,83 @@ def run_pipeline(
             # List files for this date
             files = list_files_in_folder(service, folder_id)
             json_files = [f for f in files if f["name"].endswith(".json")]
+            json_files.sort(key=lambda x: x["name"])  # Ensure determinism
             total_in_day = len(json_files)
 
-            # Sample
+            # Deterministic Sample based on date
             if sample_rate < 1.0:
                 n_sample = max(1, int(total_in_day * sample_rate))
-                json_files = random.sample(json_files, min(n_sample, total_in_day))
+                rng = random.Random(date_str)
+                sampled_files = rng.sample(json_files, min(n_sample, total_in_day))
+            else:
+                sampled_files = json_files
+                
+            # Filter out already processed matches
+            json_files = [f for f in sampled_files if Path(f["name"]).stem not in processed_match_ids]
 
             n_to_process = len(json_files)
+            target_sample_size = len(sampled_files)
+            
+            if n_to_process == 0:
+                print(f"\n[{df_idx+1}/{len(date_folders)}] {date_str}: "
+                      f"Already fully processed ({target_sample_size}/{total_in_day} sampled files done).")
+                continue
+
+            skipped = target_sample_size - n_to_process
             print(f"\n[{df_idx+1}/{len(date_folders)}] {date_str}: "
-                  f"{n_to_process}/{total_in_day} files")
+                  f"{n_to_process} files to process (skipping {skipped} already done from {target_sample_size} sampled)")
 
             day_rows = 0
 
             if in_memory:
-                # Process in memory (no disk writes for JSON)
-                for fi, file_info in enumerate(json_files):
-                    try:
-                        content = download_file_content(service, file_info["id"])
-                        data = json.loads(content)
-                        rows = extract_metrics(data)
+                import concurrent.futures
+                import threading
+                import time
 
-                        fname = Path(file_info["name"]).stem
-                        parts = fname.split("_")
-                        file_date = ""
-                        if len(parts) >= 2 and len(parts[1]) == 8:
-                            raw = parts[1]
-                            file_date = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+                thread_local = threading.local()
 
+                def get_thread_service():
+                    if not hasattr(thread_local, "service"):
+                        thread_local.service = get_drive_service()
+                    return thread_local.service
+
+                def process_single_file(file_info):
+                    for attempt in range(3):
+                        try:
+                            svc = get_thread_service()
+                            content = download_file_content(svc, file_info["id"])
+                            data = json.loads(content)
+                            rows = extract_metrics(data)
+
+                            fname = Path(file_info["name"]).stem
+                            parts = fname.split("_")
+                            file_date = ""
+                            if len(parts) >= 2 and len(parts[1]) == 8:
+                                raw = parts[1]
+                                file_date = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+
+                            for row in rows:
+                                row["match_id"] = fname
+                                row["date"] = file_date or date_str
+                            return rows
+                        except Exception as e:
+                            if attempt == 2:
+                                print(f"    WARN: {file_info['name']}: {e}", file=sys.stderr)
+                                return []
+                            time.sleep(1 + attempt * 2)
+
+                completed = 0
+                # Using 10 workers avoids hitting the Google Drive API rate limits
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = {executor.submit(process_single_file, fi): fi for fi in json_files}
+                    for future in concurrent.futures.as_completed(futures):
+                        rows = future.result()
                         for row in rows:
-                            row["match_id"] = fname
-                            row["date"] = file_date or date_str
                             writer.writerow(row)
                             day_rows += 1
-
-                    except Exception as e:
-                        print(f"    WARN: {file_info['name']}: {e}", file=sys.stderr)
-
-                    if (fi + 1) % 100 == 0:
-                        print(f"    {fi+1}/{n_to_process} downloaded+processed")
+                        completed += 1
+                        if completed % 100 == 0:
+                            print(f"    {completed}/{n_to_process} downloaded+processed")
 
             else:
                 # Disk-based processing (for very large files or debugging)
