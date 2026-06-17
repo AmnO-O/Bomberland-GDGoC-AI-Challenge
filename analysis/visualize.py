@@ -57,6 +57,13 @@ def _save_fig(fig, path: str, dpi: int = 150):
     print(f"  → {path}")
 
 
+def _get_sid_to_team(data_dir: str) -> dict:
+    perf_csv = Path(data_dir) / "submission_performance.csv"
+    if not perf_csv.exists():
+        return {}
+    return {r["submission_id"]: r["team_name"] for r in _load_csv(str(perf_csv))}
+
+
 # ── Plot 1: Code type distribution ───────────────────────────────────────────
 
 def plot_code_type_distribution(data_dir: str, plot_dir: str):
@@ -212,8 +219,9 @@ def plot_behavioral_heatmap(data_dir: str, plot_dir: str):
     fig, ax = plt.subplots(figsize=(12, max(6, len(subs) * 0.4)))
     im = ax.imshow(norm_matrix, aspect="auto", cmap="YlOrRd")
 
-    # Truncate long names
-    display_names = [s[:25] for s in subs]
+    # Map to team names
+    sid_map = _get_sid_to_team(data_dir)
+    display_names = [sid_map.get(s, s[:8]) for s in subs]
     pretty_keys = [k.replace("_", " ").title() for k in metric_keys]
 
     ax.set_xticks(range(len(metric_keys)))
@@ -281,6 +289,7 @@ def plot_strategy_clusters(data_dir: str, plot_dir: str):
 
     # Color by baseline vs student
     is_baseline = ["baseline" in s for s in subs]
+    sid_map = _get_sid_to_team(data_dir)
 
     fig, ax = plt.subplots(figsize=(10, 8))
     for i, sid in enumerate(subs):
@@ -288,7 +297,7 @@ def plot_strategy_clusters(data_dir: str, plot_dir: str):
         marker = "s" if is_baseline[i] else "o"
         ax.scatter(pca[i, 0], pca[i, 1], c=color, marker=marker, s=80, edgecolors="black",
                    linewidth=0.5, zorder=3)
-        label = sid[:20]
+        label = sid_map.get(sid, sid[:8])
         ax.annotate(label, (pca[i, 0], pca[i, 1]),
                     textcoords="offset points", xytext=(5, 5), fontsize=7, alpha=0.8)
 
@@ -325,7 +334,7 @@ def plot_complexity_vs_rating(data_dir: str, plot_dir: str):
             xs.append(loc)
             ys.append(score)
             colors.append(COLORS.get(ctype, "#999"))
-            labels.append(sid[:20])
+            labels.append(pr.get("team_name", sid[:8]))
 
     if not xs:
         print("  SKIP: no matched data")
@@ -386,6 +395,42 @@ def plot_submission_timeline(data_dir: str, plot_dir: str):
     _save_fig(fig, str(Path(plot_dir) / "submission_timeline.png"))
 
 
+# ── Plot 8: Daily Submissions Line Chart ──────────────────────────────────────
+
+def plot_daily_submissions(data_dir: str, plot_dir: str):
+    """Line chart of number of submissions per day."""
+    if not HAS_MPL:
+        return
+    csv_path = Path(data_dir) / "submission_timeline.csv"
+    if not csv_path.exists():
+        return
+
+    rows = _load_csv(str(csv_path))
+    if not rows:
+        return
+
+    dates = [r["created_at"][:10] for r in rows if r["created_at"]]
+    date_counts = Counter(dates)
+    
+    sorted_dates = sorted(date_counts.keys())
+    counts = [date_counts[d] for d in sorted_dates]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(sorted_dates, counts, marker="o", linestyle="-", color="#E91E63", linewidth=2)
+    ax.fill_between(sorted_dates, counts, alpha=0.1, color="#E91E63")
+    
+    ax.set_xticks(range(len(sorted_dates)))
+    ax.set_xticklabels(sorted_dates, rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Number of Submissions")
+    ax.set_title("Daily Submissions (Line Chart)", fontsize=14, fontweight="bold")
+    ax.grid(alpha=0.3)
+
+    for i, count in enumerate(counts):
+        ax.annotate(str(count), (sorted_dates[i], counts[i]), textcoords="offset points", xytext=(0, 5), ha="center", fontsize=8)
+
+    _save_fig(fig, str(Path(plot_dir) / "daily_submissions.png"))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def generate_all_plots(data_dir: str = "analysis/data", plot_dir: str = "analysis/plots"):
@@ -400,6 +445,7 @@ def generate_all_plots(data_dir: str = "analysis/data", plot_dir: str = "analysi
     plot_strategy_clusters(data_dir, plot_dir)
     plot_complexity_vs_rating(data_dir, plot_dir)
     plot_submission_timeline(data_dir, plot_dir)
+    plot_daily_submissions(data_dir, plot_dir)
     print("\nAll plots generated.")
 
 
