@@ -266,7 +266,28 @@ def plot_strategy_clusters(data_dir: str, plot_dir: str):
             except (ValueError, KeyError):
                 pass
 
+    # Find the top submission ID per team
+    perf_csv = Path(data_dir) / "submission_performance.csv"
+    best_sid_per_team = set()
+    if perf_csv.exists():
+        perf_rows = _load_csv(str(perf_csv))
+        team_best = {}
+        for r in perf_rows:
+            team = r.get("team_name")
+            sid = r["submission_id"]
+            try:
+                score = float(r["score"])
+                if team not in team_best or score > team_best[team]["score"]:
+                    team_best[team] = {"sid": sid, "score": score}
+            except (ValueError, KeyError):
+                pass
+        best_sid_per_team = {v["sid"] for v in team_best.values()}
+
+    # Filter to only the best agent per team (or baselines)
     subs = [s for s in sub_metrics if len(sub_metrics[s][metric_keys[0]]) >= 10]
+    if best_sid_per_team:
+        subs = [s for s in subs if s in best_sid_per_team or "baseline" in s]
+
     if len(subs) < 3:
         print("  SKIP: not enough submissions for PCA")
         return
