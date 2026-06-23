@@ -93,9 +93,10 @@ def plot_code_type_distribution(data_dir: str, plot_dir: str):
         pretty = l.replace("_", " ").title()
         display_labels.append(f"{pretty}\n({s}, {pct:.0f}%)")
 
-    wedges, texts = ax.pie(sizes, labels=display_labels, colors=colors,
-                           startangle=90, textprops={"fontsize": 10})
-    ax.set_title("Submission Code Types (Student Submissions)", fontsize=14, fontweight="bold")
+    wedges, texts = ax.pie(sizes, labels=None, colors=colors, startangle=90)
+    ax.legend(wedges, display_labels, title="Categories", loc="center left", bbox_to_anchor=(1, 0, 0.5, 1), fontsize=9)
+    
+    ax.set_title("Submission Code Types", fontsize=14, fontweight="bold")
 
     _save_fig(fig, str(Path(plot_dir) / "code_type_distribution.png"))
 
