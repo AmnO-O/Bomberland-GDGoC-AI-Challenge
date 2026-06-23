@@ -129,7 +129,7 @@ def run_timing_benchmark(agent_path, opponents, num_matches=10, max_steps=500, s
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Estimate the average inference time of an agent.")
     parser.add_argument("agent", type=str, help="Path to the target agent (e.g., submissions/team_a/agent.py)")
-    parser.add_argument("--opponents", nargs="+", default=["None", "None", "None"], help="Paths to 3 opponent agents. Use 'None' for random baselines.")
+    parser.add_argument("--opponents", nargs="+", default=["agent/smarter_rule_agent.py", "agent/genius_rule_agent.py", "agent/submission_v9/submission_v9_up.py"], help="Paths to 3 opponent agents. Use 'None' for random baselines.")
     parser.add_argument("--num_matches", type=int, default=10, help="Number of matches to simulate.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
     

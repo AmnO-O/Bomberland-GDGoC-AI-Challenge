@@ -114,6 +114,7 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
     for episode in range(num_episodes):
         episode_seed = None if seed is None else seed + episode
         obs = env.reset(seed=episode_seed)
+        tmp_seed = episode_seed
         done = False
         step = 0
         death_order = []
@@ -149,6 +150,10 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
         else:
             print(f"Episode {episode + 1}: Draw | Died: {death_order}")
 
+        if "submission_v9" in death_order:
+            print("episode seed", episode_seed)
+            print()
+
     print("\n=== Summary ===")
     for i in range(n_players):
         print(f"{info[i]['name']}: {info[i]['wins']} wins")
@@ -156,9 +161,10 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent_paths", nargs="+", default=["None", "None", "None", "None"],
+    parser.add_argument("--agent_paths", nargs="+", default=["agent/genius_rule_agent.py", "agent/smarter_rule_agent.py", 
+                                                              "agent/submission_v9/submission_v9_up.py", "agent/submission_v10/tmp.py"],
                         help="Paths to agent.py files, agent folders, or baseline names (e.g. RandomAgent). Use 'None' for a random baseline.")
-    parser.add_argument("--num_episodes", type=int, default=10)
+    parser.add_argument("--num_episodes", type=int, default=200)
     parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--visualize", type=str2bool, default=False)

@@ -23,7 +23,7 @@ class NoBombAgent:
         pass
     
     def act(self, obs):
-        return 5
+        return 0
 
 # class WrongDeviceAgent:
 #     def __init__(self):

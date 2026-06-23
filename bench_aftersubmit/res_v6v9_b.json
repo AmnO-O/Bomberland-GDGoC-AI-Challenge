@@ -1,0 +1,83 @@
+{
+ "done": 32,
+ "matches": 32,
+ "targets": [
+  "v6",
+  "v9"
+ ],
+ "elapsed_s": 29.6,
+ "agents": {
+  "v9": {
+   "games": 32,
+   "avgRank": 0.906,
+   "win_pct": 31.2,
+   "death_pct": 0.0,
+   "kills": 0.34,
+   "boxes": 5.88,
+   "items": 9.25,
+   "bombs": 45.2,
+   "maxms": 4.6,
+   "timeouts": 0
+  },
+  "v6": {
+   "games": 32,
+   "avgRank": 0.781,
+   "win_pct": 43.8,
+   "death_pct": 9.4,
+   "kills": 0.38,
+   "boxes": 5.94,
+   "items": 9.25,
+   "bombs": 44.0,
+   "maxms": 2.5,
+   "timeouts": 0
+  },
+  "genius": {
+   "games": 16,
+   "avgRank": 2.188,
+   "win_pct": 18.8,
+   "death_pct": 81.2,
+   "kills": 0.31,
+   "boxes": 5.12,
+   "items": 3.75,
+   "bombs": 17.9,
+   "maxms": 0.7,
+   "timeouts": 0
+  },
+  "boxfarmer": {
+   "games": 12,
+   "avgRank": 2.667,
+   "win_pct": 0.0,
+   "death_pct": 83.3,
+   "kills": 0.0,
+   "boxes": 5.25,
+   "items": 3.33,
+   "bombs": 5.0,
+   "maxms": 0.5,
+   "timeouts": 0
+  },
+  "tactical": {
+   "games": 19,
+   "avgRank": 1.632,
+   "win_pct": 21.1,
+   "death_pct": 52.6,
+   "kills": 0.16,
+   "boxes": 6.95,
+   "items": 6.37,
+   "bombs": 28.2,
+   "maxms": 0.7,
+   "timeouts": 0
+  },
+  "smarter": {
+   "games": 17,
+   "avgRank": 2.294,
+   "win_pct": 5.9,
+   "death_pct": 70.6,
+   "kills": 0.06,
+   "boxes": 6.06,
+   "items": 3.94,
+   "bombs": 16.6,
+   "maxms": 1.6,
+   "timeouts": 0
+  }
+ }
+}

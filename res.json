@@ -1,0 +1,130 @@
+{
+ "done": 40,
+ "matches": 800,
+ "targets": [
+  "last_dance"
+ ],
+ "elapsed_s": 260.6,
+ "agents": {
+  "top_pool_2": {
+   "games": 15,
+   "avgRank": 0.6,
+   "win_pct": 60.0,
+   "death_pct": 6.7,
+   "kills": 0.33,
+   "boxes": 7.67,
+   "items": 7.27,
+   "bombs": 86.2,
+   "maxms": 12.5,
+   "timeouts": 0
+  },
+  "smarter": {
+   "games": 14,
+   "avgRank": 2.5,
+   "win_pct": 0.0,
+   "death_pct": 78.6,
+   "kills": 0.0,
+   "boxes": 4.14,
+   "items": 3.57,
+   "bombs": 10.6,
+   "maxms": 0.9,
+   "timeouts": 0
+  },
+  "last_dance": {
+   "games": 40,
+   "avgRank": 0.75,
+   "win_pct": 45.0,
+   "death_pct": 2.5,
+   "kills": 0.42,
+   "boxes": 8.1,
+   "items": 8.88,
+   "bombs": 73.5,
+   "maxms": 62.0,
+   "timeouts": 0
+  },
+  "top_pool_1": {
+   "games": 12,
+   "avgRank": 0.75,
+   "win_pct": 41.7,
+   "death_pct": 0.0,
+   "kills": 0.25,
+   "boxes": 6.0,
+   "items": 6.92,
+   "bombs": 81.0,
+   "maxms": 7.4,
+   "timeouts": 0
+  },
+  "v6": {
+   "games": 13,
+   "avgRank": 2.077,
+   "win_pct": 7.7,
+   "death_pct": 7.7,
+   "kills": 0.08,
+   "boxes": 4.85,
+   "items": 6.85,
+   "bombs": 35.8,
+   "maxms": 3.5,
+   "timeouts": 0
+  },
+  "tactical": {
+   "games": 12,
+   "avgRank": 2.667,
+   "win_pct": 0.0,
+   "death_pct": 100.0,
+   "kills": 0.0,
+   "boxes": 5.25,
+   "items": 3.08,
+   "bombs": 25.5,
+   "maxms": 0.7,
+   "timeouts": 0
+  },
+  "sub_v8_up": {
+   "games": 14,
+   "avgRank": 1.143,
+   "win_pct": 28.6,
+   "death_pct": 14.3,
+   "kills": 0.29,
+   "boxes": 6.5,
+   "items": 10.5,
+   "bombs": 61.1,
+   "maxms": 12.3,
+   "timeouts": 0
+  },
+  "core_base": {
+   "games": 11,
+   "avgRank": 1.636,
+   "win_pct": 0.0,
+   "death_pct": 9.1,
+   "kills": 0.09,
+   "boxes": 4.73,
+   "items": 7.91,
+   "bombs": 36.1,
+   "maxms": 1.8,
+   "timeouts": 0
+  },
+  "genius": {
+   "games": 19,
+   "avgRank": 2.632,
+   "win_pct": 0.0,
+   "death_pct": 68.4,
+   "kills": 0.0,
+   "boxes": 4.47,
+   "items": 5.26,
+   "bombs": 18.5,
+   "maxms": 8.3,
+   "timeouts": 0
+  },
+  "model_v8": {
+   "games": 10,
+   "avgRank": 1.4,
+   "win_pct": 30.0,
+   "death_pct": 0.0,
+   "kills": 0.2,
+   "boxes": 5.6,
+   "items": 8.4,
+   "bombs": 46.6,
+   "maxms": 11.7,
+   "timeouts": 0
+  }
+ }
+}
