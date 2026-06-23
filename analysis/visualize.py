@@ -437,8 +437,21 @@ def plot_daily_submissions(data_dir: str, plot_dir: str):
     dates = [r["created_at"][:10] for r in rows if r["created_at"]]
     date_counts = Counter(dates)
     
-    sorted_dates = sorted(date_counts.keys())
-    counts = [date_counts[d] for d in sorted_dates]
+    if not date_counts:
+        return
+        
+    from datetime import datetime, timedelta
+    start_date = datetime.strptime(min(date_counts.keys()), "%Y-%m-%d")
+    end_date = datetime.strptime("2026-06-22", "%Y-%m-%d") # Competition end
+    
+    # Generate continuous list of dates
+    current = start_date
+    sorted_dates = []
+    while current <= end_date:
+        sorted_dates.append(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+        
+    counts = [date_counts.get(d, 0) for d in sorted_dates]
 
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(sorted_dates, counts, marker="o", linestyle="-", color="#E91E63", linewidth=2)
