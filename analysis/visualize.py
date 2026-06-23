@@ -90,7 +90,10 @@ def plot_code_type_distribution(data_dir: str, plot_dir: str):
     display_labels = []
     for l, s in zip(labels, sizes):
         pct = 100 * s / sum(sizes)
-        pretty = l.replace("_", " ").title()
+        if l == "ml_pytorch":
+            pretty = "Pure ML"
+        else:
+            pretty = l.replace("_", " ").title()
         display_labels.append(f"{pretty}\n({s}, {pct:.0f}%)")
 
     wedges, texts = ax.pie(sizes, labels=None, colors=colors, startangle=90)
